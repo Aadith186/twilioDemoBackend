@@ -1,0 +1,78 @@
+const mongoose = require('mongoose');
+
+// ─── QUOTE SCHEMA ─────────────────────────────────────────────────────────────
+const QuoteSchema = new mongoose.Schema({
+  priceMin: Number,
+  priceMax: Number,
+  complexity: { type: Number, min: 1, max: 5 },
+  basis: String,
+  details: {
+    sqft: String,
+    roofType: String,
+    wallPanels: String,
+    insulation: String,
+    doors: String,
+    region: String,
+    specialRequirements: String
+  },
+  generatedAt: { type: Date, default: Date.now }
+});
+
+// ─── MESSAGE SCHEMA ───────────────────────────────────────────────────────────
+const MessageSchema = new mongoose.Schema({
+  role: { type: String, enum: ['user', 'assistant'], required: true },
+  content: { type: String, required: true },
+  timestamp: { type: Date, default: Date.now },
+  quote: QuoteSchema
+});
+
+// ─── CONVERSATION SCHEMA ──────────────────────────────────────────────────────
+const ConversationSchema = new mongoose.Schema({
+  leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', required: true },
+  messages: [MessageSchema],
+  quote: QuoteSchema,
+  status: { type: String, enum: ['active', 'ended'], default: 'active' },
+  startedAt: { type: Date, default: Date.now },
+  endedAt: Date,
+  sessionId: { type: String, required: true },
+  // Voice channel support
+  channel: { type: String, enum: ['chat', 'voice'], default: 'chat' },
+  callDuration: Number,
+});
+
+// ─── LEAD SCHEMA ──────────────────────────────────────────────────────────────
+const LeadSchema = new mongoose.Schema({
+  name: { type: String, default: 'Unknown' },
+  email: String,
+  phone: String,
+  company: String,
+  score: { type: Number, default: 0, min: 0, max: 100 },
+  tier: { type: String, enum: ['hot', 'warm', 'cold', 'new'], default: 'new' },
+  scoreBreakdown: {
+    projectSize: { points: Number, reason: String },
+    budgetSignals: { points: Number, reason: String },
+    timeline: { points: Number, reason: String },
+    decisionMaker: { points: Number, reason: String },
+    projectClarity: { points: Number, reason: String }
+  },
+  requirements: String,
+  conversations: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Conversation' }],
+  totalConversations: { type: Number, default: 0 },
+  lastSeen: { type: Date, default: Date.now },
+  firstSeen: { type: Date, default: Date.now },
+  isReturning: { type: Boolean, default: false }
+}, { timestamps: true });
+
+// Auto-set tier based on score
+LeadSchema.pre('save', function (next) {
+  if (this.score >= 75) this.tier = 'hot';
+  else if (this.score >= 45) this.tier = 'warm';
+  else if (this.score >= 1) this.tier = 'cold';
+  else this.tier = 'new';
+  next();
+});
+
+const Lead = mongoose.model('Lead', LeadSchema);
+const Conversation = mongoose.model('Conversation', ConversationSchema);
+
+module.exports = { Lead, Conversation };
