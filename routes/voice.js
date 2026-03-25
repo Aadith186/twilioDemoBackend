@@ -12,7 +12,9 @@ const voiceClaude = require('../services/voice-claude');
 // Google.en-IN-Neural2-A = Indian English Female
 const VOICE = process.env.TWILIO_VOICE || 'Polly.Matthew';
 const SPEECH_LANGUAGE = process.env.TWILIO_SPEECH_LANG || 'en-IN';
-const SPEECH_TIMEOUT = process.env.TWILIO_SPEECH_TIMEOUT || 'auto'; // 'auto' or seconds
+// NOTE: experimental_conversations model requires an integer — 'auto' is NOT supported with it.
+// Set TWILIO_SPEECH_TIMEOUT in your .env to override (e.g. 1 or 2). Default is 1 second.
+const SPEECH_TIMEOUT = process.env.TWILIO_SPEECH_TIMEOUT || '1';
 
 // Helper: build the base URL from the request
 function getBaseUrl(req) {
@@ -28,7 +30,7 @@ function getBaseUrl(req) {
 // Helper: wrap text in TwiML Say + Gather loop
 // bargeIn="true" = stops TTS immediately when caller starts speaking
 // speechModel="experimental_conversations" = best for conversational AI
-// speechTimeout must be integer (not "auto") when using experimental_conversations
+// speechTimeout must be an integer — "auto" is NOT supported with experimental_conversations
 function buildTwiML(res, sayText, req, isSSML = true) {
   const baseUrl = getBaseUrl(req);
   const voiceAttr = `voice="${VOICE}"`;
@@ -42,7 +44,7 @@ function buildTwiML(res, sayText, req, isSSML = true) {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="2" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
+  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
     <Say ${voiceAttr}>${sayContent}</Say>
   </Gather>
   <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="4" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
@@ -149,7 +151,7 @@ router.post('/respond', async (req, res) => {
     const baseUrl = getBaseUrl(req);
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="2" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
+  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
     <Say voice="${VOICE}">Sorry, I didn't quite catch that. Could you repeat that for me?</Say>
   </Gather>
   <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="4" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
@@ -188,7 +190,7 @@ router.post('/listen', (req, res) => {
   const baseUrl = getBaseUrl(req);
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="3" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
+  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
     <Say voice="${VOICE}">I'm still here whenever you're ready.</Say>
   </Gather>
   <Say voice="${VOICE}">It seems like we got disconnected. Feel free to call back anytime. Bye!</Say>
