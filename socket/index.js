@@ -2,13 +2,16 @@ const { v4: uuidv4 } = require('uuid');
 const { Lead, Conversation } = require('../models');
 const claudeService = require('../services/claude');
 
+/** Allow reconnect / refresh to reopen a recently ended conversation (ms). */
+const RESUME_CONVERSATION_MS = 30 * 60 * 1000;
+
 module.exports = function setupSockets(io) {
 
   io.on('connection', (socket) => {
     console.log(`Socket connected: ${socket.id}`);
 
     // ─── START SESSION ──────────────────────────────────────────────────────
-    socket.on('start_session', async ({ sessionId, fingerprint }) => {
+    socket.on('start_session', async ({ sessionId, fingerprint, resumeConversationId }) => {
       try {
         const sid = sessionId || uuidv4();
         socket.sessionId = sid;
@@ -38,6 +41,77 @@ module.exports = function setupSockets(io) {
         if (!lead) {
           lead = new Lead({ lastSeen: new Date(), firstSeen: new Date() });
           await lead.save();
+        }
+
+        // Resume same conversation after refresh (same lead + stored conversation id)
+        if (resumeConversationId) {
+          const existing = await Conversation.findById(resumeConversationId);
+          const belongsToLead =
+            existing &&
+            existing.leadId &&
+            existing.leadId.toString() === lead._id.toString();
+          const endedRecently =
+            existing &&
+            existing.status === 'ended' &&
+            existing.endedAt &&
+            Date.now() - new Date(existing.endedAt).getTime() < RESUME_CONVERSATION_MS;
+          const canResume =
+            belongsToLead &&
+            (existing.status === 'active' || endedRecently);
+
+          if (canResume) {
+            existing.status = 'active';
+            existing.endedAt = undefined;
+            await existing.save();
+
+            socket.leadId = lead._id.toString();
+            socket.conversationId = existing._id.toString();
+            socket.sessionId = existing.sessionId || sid;
+
+            const uiMessages = (existing.messages || []).map((m) => ({
+              role: m.role,
+              content: m.content,
+              quote: m.quote || null,
+              timestamp: m.timestamp || existing.startedAt
+            }));
+
+            socket.emit('session_started', {
+              sessionId: existing.sessionId || sid,
+              leadId: lead._id.toString(),
+              conversationId: existing._id.toString(),
+              isReturning,
+              resumed: true,
+              greeting: null,
+              messages: uiMessages
+            });
+
+            const otherIds = lead.conversations
+              .filter((id) => id.toString() !== existing._id.toString())
+              .map((id) => id);
+            if (otherIds.length) {
+              Conversation.find({
+                _id: { $in: otherIds },
+                status: 'ended'
+              })
+                .sort({ startedAt: -1 })
+                .then((previousConversations) => {
+                  const historyMessages = previousConversations
+                    .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
+                    .flatMap((conv) =>
+                      (conv.messages || []).map((m) => ({
+                        role: m.role,
+                        content: m.content,
+                        timestamp: m.timestamp || conv.startedAt,
+                        quote: m.quote || null
+                      }))
+                    );
+                  socket.emit('history_loaded', { historyMessages });
+                })
+                .catch((err) => console.error('history_loaded error:', err));
+            }
+
+            return;
+          }
         }
 
         // Create new conversation
@@ -72,6 +146,7 @@ module.exports = function setupSockets(io) {
           leadId: lead._id.toString(),
           conversationId: conversation._id.toString(),
           isReturning,
+          resumed: false,
           greeting
         });
 
@@ -251,18 +326,10 @@ module.exports = function setupSockets(io) {
     });
 
     // ─── DISCONNECT ─────────────────────────────────────────────────────────
+    // Do not auto-end conversations here: refresh / tab close disconnects briefly
+    // and would force a new greeting. Use `end_session` for explicit end.
     socket.on('disconnect', async () => {
-      try {
-        if (socket.conversationId) {
-          await Conversation.findByIdAndUpdate(socket.conversationId, {
-            status: 'ended',
-            endedAt: new Date()
-          });
-        }
-        console.log(`Socket disconnected: ${socket.id}`);
-      } catch (err) {
-        console.error('disconnect error:', err);
-      }
+      console.log(`Socket disconnected: ${socket.id}`);
     });
   });
 };
