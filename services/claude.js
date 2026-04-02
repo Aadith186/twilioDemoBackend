@@ -3,7 +3,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-const SALES_SYSTEM_PROMPT = `You are Alex, a friendly and knowledgeable sales consultant for BuildRight Construction Services. You help customers get estimates for construction and installation projects.
+const SALES_SYSTEM_PROMPT = `You are Alex, a friendly and knowledgeable sales consultant for Steel Building Depot. You help customers get estimates for construction and installation projects.
 
 YOUR PERSONALITY:
 - Warm, professional, and conversational — never robotic
@@ -96,16 +96,33 @@ function buildMemoryContext(previousConversations) {
   return memory;
 }
 
+function buildFullConversationMessages(currentMessages, previousConversations = []) {
+  const historicalMessages = previousConversations
+    .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
+    .flatMap((conv) =>
+      (conv.messages || [])
+        .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
+        .map((m) => ({ role: m.role, content: m.content }))
+    );
+
+  const liveMessages = (currentMessages || [])
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
+    .map((m) => ({ role: m.role, content: m.content }));
+
+  return [...historicalMessages, ...liveMessages];
+}
+
 // ─── MAIN CHAT FUNCTION ───────────────────────────────────────────────────────
 async function chat(messages, previousConversations = []) {
   const memoryContext = buildMemoryContext(previousConversations);
   const systemWithMemory = SALES_SYSTEM_PROMPT + memoryContext;
+  const fullContextMessages = buildFullConversationMessages(messages, previousConversations);
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 1024,
     system: systemWithMemory,
-    messages: messages.map(m => ({ role: m.role, content: m.content }))
+    messages: fullContextMessages
   });
 
   const fullText = response.content[0].text;
@@ -145,8 +162,13 @@ async function chat(messages, previousConversations = []) {
 }
 
 // ─── LEAD SCORING FUNCTION ────────────────────────────────────────────────────
-async function scoreLead(conversationMessages, leadName) {
-  const transcript = conversationMessages
+async function scoreLead(conversationMessages, leadName, previousConversations = []) {
+  const fullConversationMessages = buildFullConversationMessages(
+    conversationMessages,
+    previousConversations
+  );
+
+  const transcript = fullConversationMessages
     .map(m => `${m.role === 'user' ? (leadName || 'Customer') : 'Alex'}: ${m.content}`)
     .join('\n');
 
@@ -221,7 +243,7 @@ async function getGreeting(isReturning, leadName, previousConversations = []) {
     return response.content[0].text;
   }
 
-  return "Hi there! 👋 Welcome to BuildRight Construction Services. I'm Alex, and I'm here to help you get an estimate for your project. To get started, could I get your name?";
+  return "Hi there! 👋 Welcome to Steel Building Depot. I'm Alex, and I'm here to help you get an estimate for your project. To get started, could I get your name?";
 }
 
 module.exports = { chat, scoreLead, getGreeting };

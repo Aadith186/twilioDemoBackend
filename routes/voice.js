@@ -102,13 +102,13 @@ router.post('/incoming', async (req, res) => {
 
       // Personalized greeting
       if (lead.name && lead.name !== 'Unknown') {
-        greeting = `Hey ${lead.name}! Good to hear from you again. Welcome back to BuildRight. How can I help you today?`;
+        greeting = `Hey ${lead.name}! Good to hear from you again. Welcome back to Steel Building Depot. How can I help you today?`;
       } else {
-        greeting = `Hey, welcome back to BuildRight! Good to hear from you again. What can I help you with today?`;
+        greeting = `Hey, welcome back to Steel Building Depot! Good to hear from you again. What can I help you with today?`;
       }
     } else {
       // New caller
-      greeting = `Hey there! Thanks for calling BuildRight Construction Services. I'm Alex, I'll be helping you out today. Before we get into things... could I get your name?`;
+      greeting = `Hey there! Thanks for calling Steel Building Depot. I'm Alex, I'll be helping you out today. Before we get into things... could I get your name?`;
     }
 
     // Store greeting in session
@@ -133,7 +133,7 @@ router.post('/incoming', async (req, res) => {
 
   } catch (err) {
     console.error('[Voice] Incoming call error:', err);
-    const fallback = `Hey, thanks for calling BuildRight Construction. I'm Alex. What can I help you with today?`;
+    const fallback = `Hey, thanks for calling Steel Building Depot. I'm Alex. What can I help you with today?`;
     buildTwiML(res, fallback, req, false);
   }
 });
@@ -270,7 +270,16 @@ router.post('/status', async (req, res) => {
     const userMessages = session.messages.filter(m => m.role === 'user');
     if (userMessages.length >= 2) {
       try {
-        const scoreData = await claudeService.scoreLead(session.messages, lead.name);
+        const previousConversations = await Conversation.find({
+          _id: { $in: lead.conversations.filter(id => id.toString() !== conversation._id.toString()) },
+          status: 'ended'
+        }).sort({ startedAt: 1 });
+
+        const scoreData = await claudeService.scoreLead(
+          session.messages,
+          lead.name,
+          previousConversations
+        );
 
         lead.score = scoreData.score;
         if (scoreData.scoreBreakdown) lead.scoreBreakdown = scoreData.scoreBreakdown;

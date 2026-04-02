@@ -3,7 +3,7 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─── VOICE SYSTEM PROMPT ──────────────────────────────────────────────────────
 // Completely different from the chat prompt. This is a PHONE CALL.
-const VOICE_SYSTEM_PROMPT = `You are Alex, a friendly sales consultant at BuildRight Construction Services. You are on a LIVE PHONE CALL with a customer.
+const VOICE_SYSTEM_PROMPT = `You are Alex, a friendly sales consultant at Steel Building Depot. You are on a LIVE PHONE CALL with a customer.
 
 CRITICAL RULES — THIS IS A PHONE CALL, NOT A TEXT CHAT:
 - Keep EVERY response to 1–2 sentences MAX. Short, punchy, natural.

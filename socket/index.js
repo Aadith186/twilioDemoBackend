@@ -16,20 +16,16 @@ module.exports = function setupSockets(io) {
 
         // Check for returning lead by fingerprint/sessionId
         let lead = null;
-        let previousConversations = [];
         let isReturning = false;
+        let previousConversationIds = [];
 
         if (fingerprint) {
           // Try to find existing lead by stored leadId in fingerprint
           lead = await Lead.findById(fingerprint).catch(() => null);
           if (lead) {
             isReturning = true;
-            // Load last 3 conversations with full messages for memory
-            const convIds = lead.conversations.slice(-3);
-            previousConversations = await Conversation.find({
-              _id: { $in: convIds },
-              status: 'ended'
-            }).sort({ startedAt: -1 });
+            // Keep full prior conversation history for context + history rendering
+            previousConversationIds = [...lead.conversations];
 
             // Update last seen
             lead.lastSeen = new Date();
@@ -61,8 +57,11 @@ module.exports = function setupSockets(io) {
         socket.leadId = lead._id.toString();
         socket.conversationId = conversation._id.toString();
 
-        // Get greeting
-        const greeting = await claudeService.getGreeting(isReturning, lead.name);
+        // Fast greeting: avoid LLM call in startup path for snappier UX
+        const greeting =
+          isReturning && lead.name && lead.name !== 'Unknown'
+            ? `Welcome back ${lead.name}! I am Alex from Steel Building Depot. How can I help today?`
+            : "Hi there! Welcome to Steel Building Depot. I'm Alex, and I'm here to help with your building estimate. Could I get your name?";
 
         // Save greeting as first message
         conversation.messages.push({ role: 'assistant', content: greeting });
@@ -75,6 +74,31 @@ module.exports = function setupSockets(io) {
           isReturning,
           greeting
         });
+
+        // Send previous history after session is ready (non-blocking)
+        if (previousConversationIds.length) {
+          Conversation.find({
+            _id: { $in: previousConversationIds },
+            status: 'ended'
+          })
+            .sort({ startedAt: -1 })
+            .then((previousConversations) => {
+              const historyMessages = previousConversations
+                .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
+                .flatMap((conv) =>
+                  (conv.messages || []).map((m) => ({
+                    role: m.role,
+                    content: m.content,
+                    timestamp: m.timestamp || conv.startedAt,
+                    quote: m.quote || null
+                  }))
+                );
+              socket.emit('history_loaded', { historyMessages });
+            })
+            .catch((err) => {
+              console.error('history_loaded error:', err);
+            });
+        }
 
         // Notify admin of new session
         io.to('admin').emit('new_lead_activity', {
@@ -111,13 +135,13 @@ module.exports = function setupSockets(io) {
         socket.emit('ai_typing', true);
 
         // Load previous conversations for memory
-        const prevConvIds = lead.conversations
-          .filter(id => id.toString() !== socket.conversationId)
-          .slice(-3);
+        const prevConvIds = lead.conversations.filter(
+          id => id.toString() !== socket.conversationId
+        );
         const previousConversations = await Conversation.find({
           _id: { $in: prevConvIds },
           status: 'ended'
-        });
+        }).sort({ startedAt: 1 });
 
         // Get AI response
         const { text, quoteData } = await claudeService.chat(
@@ -146,10 +170,14 @@ module.exports = function setupSockets(io) {
           timestamp: new Date()
         });
 
-        // Score lead every 4 messages or when quote is generated
+        // Score lead on every user message
         const userMessageCount = conversation.messages.filter(m => m.role === 'user').length;
-        if (userMessageCount % 4 === 0 || quoteData) {
-          const scoreData = await claudeService.scoreLead(conversation.messages, lead.name);
+        if (userMessageCount > 0) {
+          const scoreData = await claudeService.scoreLead(
+            conversation.messages,
+            lead.name,
+            previousConversations
+          );
 
           // Update lead with score and extracted info
           lead.score = scoreData.score;
@@ -179,7 +207,11 @@ module.exports = function setupSockets(io) {
 
         // Also extract name early from first few messages
         if (userMessageCount <= 2 && lead.name === 'Unknown') {
-          const scoreData = await claudeService.scoreLead(conversation.messages, null);
+          const scoreData = await claudeService.scoreLead(
+            conversation.messages,
+            null,
+            previousConversations
+          );
           if (scoreData.name) {
             lead.name = scoreData.name;
             await lead.save();
