@@ -195,9 +195,9 @@ router.post('/incoming', async (req, res) => {
       } catch (greetErr) {
         console.error('[Voice] Returning greeting generation error:', greetErr.message);
         if (lead.name && lead.name !== 'Unknown') {
-          greeting = `Hey ${lead.name}! Good to hear from you again. Welcome back to Steel Building Depot. How can I help you today?`;
+          greeting = `Hi ${lead.name}, good to hear from you again — this is Alex at Steel Building Depot. What can I help you with today?`;
         } else {
-          greeting = `Hey, welcome back to Steel Building Depot! Good to hear from you again. What can I help you with today?`;
+          greeting = `Hi, welcome back to Steel Building Depot. I'm Alex — what can I help you with today?`;
         }
       }
     } else {
@@ -209,7 +209,7 @@ router.post('/incoming', async (req, res) => {
       });
       await lead.save();
       session.leadId = lead._id.toString();
-      greeting = `Hey there! Thanks for calling Steel Building Depot. I'm Alex, I'll be helping you out today. Before we get into things... could I get your name?`;
+      greeting = `Thanks for calling Steel Building Depot — I'm Alex. Before we get into your project, could I get your name?`;
     }
 
     // Store greeting in session

@@ -163,18 +163,18 @@ module.exports = function setupSockets(io) {
 
         let greetingToSend = null;
         if (!hadPriorConversations) {
-          // New lead: regular welcome + ask name
+          // New lead: professional welcome + ask name (matches chat SALES_SYSTEM_PROMPT register)
           greetingToSend =
             isReturning && lead.name && lead.name !== 'Unknown'
-              ? `Welcome back ${lead.name}! I am Alex from Steel Building Depot. How can I help today?`
-              : "Hi there! Welcome to Steel Building Depot. I'm Alex, and I'm here to help with your building estimate. Could I get your name?";
+              ? `Welcome back, ${lead.name}. I'm Alex at Steel Building Depot. What can I help you with on your project today?`
+              : "Hi — thanks for visiting Steel Building Depot. I'm Alex; I help folks get a ballpark on steel building projects. Could I get your name to get started?";
           conversation.messages.push({ role: 'assistant', content: greetingToSend });
           await conversation.save();
         } else if (shouldSendLongGapGreeting) {
-          // Returning user but last chat was > 30 minutes ago: send a short follow-up
+          // Returning user but last chat was > 30 minutes ago: short professional follow-up
           greetingToSend = lead.name && lead.name !== 'Unknown'
-            ? `Hey ${lead.name}, we have left here for a bit — what type of project are you planning?`
-            : `Hey, we have left here for a bit — what type of project are you planning?`;
+            ? `Hi ${lead.name}, good to see you back. Picking up where we left off, or looking at something new?`
+            : `Hi — good to see you back. Picking up where we left off, or looking at something new?`;
           conversation.messages.push({ role: 'assistant', content: greetingToSend });
           await conversation.save();
         }
