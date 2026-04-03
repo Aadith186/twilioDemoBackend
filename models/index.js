@@ -1,5 +1,16 @@
 const mongoose = require('mongoose');
 
+// ─── PROJECT LIFECYCLE (AI-updated from chat + voice) ─────────────────────────
+const PROJECT_LIFECYCLE_STAGES = [
+  'Initial Contact',
+  'Requirements Gathered',
+  'Proposal Sent',
+  'Negotiation',
+  'Deal Closed',
+  'Payment Done',
+  'Delivered',
+];
+
 // ─── QUOTE SCHEMA ─────────────────────────────────────────────────────────────
 const QuoteSchema = new mongoose.Schema({
   priceMin: Number,
@@ -56,6 +67,13 @@ const LeadSchema = new mongoose.Schema({
     projectClarity: { points: Number, reason: String }
   },
   requirements: String,
+  projectLifecycleStage: {
+    type: String,
+    enum: PROJECT_LIFECYCLE_STAGES,
+    default: 'Initial Contact',
+  },
+  projectLifecycleReason: String,
+  projectLifecycleUpdatedAt: Date,
   conversations: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Conversation' }],
   totalConversations: { type: Number, default: 0 },
   lastSeen: { type: Date, default: Date.now },
@@ -75,4 +93,4 @@ LeadSchema.pre('save', function (next) {
 const Lead = mongoose.model('Lead', LeadSchema);
 const Conversation = mongoose.model('Conversation', ConversationSchema);
 
-module.exports = { Lead, Conversation };
+module.exports = { Lead, Conversation, PROJECT_LIFECYCLE_STAGES };

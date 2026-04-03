@@ -122,12 +122,7 @@ async function persistVoiceTurn(req, callSid) {
       previousConversations
     );
 
-    lead.score = scoreData.score;
-    if (scoreData.scoreBreakdown) lead.scoreBreakdown = scoreData.scoreBreakdown;
-    if (scoreData.requirements) lead.requirements = scoreData.requirements;
-    if (scoreData.name && lead.name === 'Unknown') lead.name = scoreData.name;
-    if (scoreData.email && !lead.email) lead.email = scoreData.email;
-    if (scoreData.company && !lead.company) lead.company = scoreData.company;
+    claudeService.applyScoreDataToLead(lead, scoreData);
     await lead.save();
 
     const io = req.app.get('io');
@@ -139,6 +134,8 @@ async function persistVoiceTurn(req, callSid) {
         tier: lead.tier,
         scoreBreakdown: lead.scoreBreakdown,
         requirements: lead.requirements,
+        projectLifecycleStage: lead.projectLifecycleStage,
+        projectLifecycleReason: lead.projectLifecycleReason,
         quote: session.quote,
         channel: 'voice',
       });
@@ -445,12 +442,7 @@ router.post('/status', async (req, res) => {
           lead.name,
           previousConversations
         );
-        lead.score = scoreData.score;
-        if (scoreData.scoreBreakdown) lead.scoreBreakdown = scoreData.scoreBreakdown;
-        if (scoreData.requirements) lead.requirements = scoreData.requirements;
-        if (scoreData.name && lead.name === 'Unknown') lead.name = scoreData.name;
-        if (scoreData.email && !lead.email) lead.email = scoreData.email;
-        if (scoreData.company && !lead.company) lead.company = scoreData.company;
+        claudeService.applyScoreDataToLead(lead, scoreData);
         await lead.save();
 
         const io = req.app.get('io');
@@ -462,6 +454,8 @@ router.post('/status', async (req, res) => {
             tier: lead.tier,
             scoreBreakdown: lead.scoreBreakdown,
             requirements: lead.requirements,
+            projectLifecycleStage: lead.projectLifecycleStage,
+            projectLifecycleReason: lead.projectLifecycleReason,
             quote: session.quote,
             channel: 'voice',
           });

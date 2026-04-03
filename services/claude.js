@@ -1,4 +1,5 @@
 const Anthropic = require('@anthropic-ai/sdk');
+const { PROJECT_LIFECYCLE_STAGES } = require('../models');
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -161,6 +162,38 @@ async function chat(messages, previousConversations = []) {
   return { text: cleanText, quoteData };
 }
 
+function normalizeProjectLifecycleStage(raw) {
+  if (raw == null || typeof raw !== 'string') return null;
+  const t = raw.trim().toLowerCase();
+  for (const s of PROJECT_LIFECYCLE_STAGES) {
+    if (s.toLowerCase() === t) return s;
+  }
+  return null;
+}
+
+/**
+ * Apply scoreLead JSON to a Lead document (score, requirements, lifecycle, extracted fields).
+ * Lifecycle stage is only overwritten when the model returns a valid canonical stage.
+ */
+function applyScoreDataToLead(lead, scoreData) {
+  if (!scoreData || typeof scoreData !== 'object') return;
+  if (typeof scoreData.score === 'number') lead.score = scoreData.score;
+  if (scoreData.scoreBreakdown) lead.scoreBreakdown = scoreData.scoreBreakdown;
+  if (scoreData.requirements) lead.requirements = scoreData.requirements;
+  if (scoreData.name && lead.name === 'Unknown') lead.name = scoreData.name;
+  if (scoreData.email && !lead.email) lead.email = scoreData.email;
+  if (scoreData.phone && !lead.phone) lead.phone = scoreData.phone;
+  if (scoreData.company && !lead.company) lead.company = scoreData.company;
+  const stage = normalizeProjectLifecycleStage(scoreData.projectLifecycleStage);
+  if (stage) {
+    lead.projectLifecycleStage = stage;
+    if (typeof scoreData.projectLifecycleReason === 'string' && scoreData.projectLifecycleReason.trim()) {
+      lead.projectLifecycleReason = scoreData.projectLifecycleReason.trim();
+    }
+    lead.projectLifecycleUpdatedAt = new Date();
+  }
+}
+
 // ─── LEAD SCORING FUNCTION ────────────────────────────────────────────────────
 async function scoreLead(conversationMessages, leadName, previousConversations = []) {
   const fullConversationMessages = buildFullConversationMessages(
@@ -189,11 +222,15 @@ async function scoreLead(conversationMessages, leadName, previousConversations =
     "projectClarity": { "points": <0-15>, "reason": "<brief reason>" }
   },
   "requirements": "<one sentence summary of their project>",
+  "projectLifecycleStage": "<EXACTLY one of: ${PROJECT_LIFECYCLE_STAGES.join(' | ')} | null — choose the MOST ADVANCED stage clearly evidenced in the transcript; use null only if unclear>",
+  "projectLifecycleReason": "<one short phrase citing evidence; empty string if projectLifecycleStage is null>",
   "name": "<customer name if mentioned, else null>",
   "email": "<email if mentioned, else null>",
   "phone": "<phone if mentioned, else null>",
   "company": "<company if mentioned, else null>"
 }
+
+Lifecycle guide (steel building sales): map explicitly when supported — Initial Contact = first touch only; Requirements Gathered = scope/sqft/location/details discussed; Proposal Sent = quote or formal proposal shared; Negotiation = revising price/terms; Deal Closed = verbal/written commitment to proceed; Payment Done = payment or deposit confirmed; Delivered = project handoff/delivery discussed or completed.
 
 Scoring guide:
 - projectSize (0-25): Large commercial/industrial=25, medium commercial=15, small/residential=8, unclear=0
@@ -213,7 +250,17 @@ ${transcript}`
     return JSON.parse(clean);
   } catch (e) {
     console.error('Score parse error:', e);
-    return { score: 10, scoreBreakdown: {}, requirements: 'Unable to parse', name: null, email: null };
+    return {
+      score: 10,
+      scoreBreakdown: {},
+      requirements: 'Unable to parse',
+      projectLifecycleStage: null,
+      projectLifecycleReason: '',
+      name: null,
+      email: null,
+      phone: null,
+      company: null,
+    };
   }
 }
 
@@ -251,4 +298,6 @@ module.exports = {
   scoreLead,
   getGreeting,
   buildFullConversationMessages,
+  applyScoreDataToLead,
+  PROJECT_LIFECYCLE_STAGES,
 };

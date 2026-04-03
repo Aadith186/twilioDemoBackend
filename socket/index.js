@@ -282,14 +282,7 @@ module.exports = function setupSockets(io) {
             previousConversations
           );
 
-          // Update lead with score and extracted info
-          lead.score = scoreData.score;
-          if (scoreData.scoreBreakdown) lead.scoreBreakdown = scoreData.scoreBreakdown;
-          if (scoreData.requirements) lead.requirements = scoreData.requirements;
-          if (scoreData.name && lead.name === 'Unknown') lead.name = scoreData.name;
-          if (scoreData.email && !lead.email) lead.email = scoreData.email;
-          if (scoreData.phone && !lead.phone) lead.phone = scoreData.phone;
-          if (scoreData.company && !lead.company) lead.company = scoreData.company;
+          claudeService.applyScoreDataToLead(lead, scoreData);
 
           await lead.save();
 
@@ -301,6 +294,8 @@ module.exports = function setupSockets(io) {
             tier: lead.tier,
             scoreBreakdown: lead.scoreBreakdown,
             requirements: lead.requirements,
+            projectLifecycleStage: lead.projectLifecycleStage,
+            projectLifecycleReason: lead.projectLifecycleReason,
             quote: quoteData || conversation.quote
           });
 
