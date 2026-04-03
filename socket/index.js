@@ -131,14 +131,22 @@ module.exports = function setupSockets(io) {
         socket.leadId = lead._id.toString();
         socket.conversationId = conversation._id.toString();
 
-        // Fast greeting: avoid LLM call in startup path for snappier UX
+        // Returning users who already have chat history see prior messages via history_loaded;
+        // start a fresh thread with no assistant greeting so they can type first.
+        const hadPriorConversations =
+          isReturning && Array.isArray(previousConversationIds) && previousConversationIds.length > 0;
+
         const greeting =
           isReturning && lead.name && lead.name !== 'Unknown'
             ? `Welcome back ${lead.name}! I am Alex from Steel Building Depot. How can I help today?`
             : "Hi there! Welcome to Steel Building Depot. I'm Alex, and I'm here to help with your building estimate. Could I get your name?";
 
-        // Save greeting as first message
-        conversation.messages.push({ role: 'assistant', content: greeting });
+        let greetingToSend = greeting;
+        if (hadPriorConversations) {
+          greetingToSend = null;
+        } else {
+          conversation.messages.push({ role: 'assistant', content: greeting });
+        }
         await conversation.save();
 
         socket.emit('session_started', {
@@ -147,7 +155,7 @@ module.exports = function setupSockets(io) {
           conversationId: conversation._id.toString(),
           isReturning,
           resumed: false,
-          greeting
+          greeting: greetingToSend
         });
 
         // Send previous history after session is ready (non-blocking)
