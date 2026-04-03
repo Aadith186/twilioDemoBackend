@@ -246,4 +246,9 @@ async function getGreeting(isReturning, leadName, previousConversations = []) {
   return "Hi there! 👋 Welcome to Steel Building Depot. I'm Alex, and I'm here to help you get an estimate for your project. To get started, could I get your name?";
 }
 
-module.exports = { chat, scoreLead, getGreeting };
+module.exports = {
+  chat,
+  scoreLead,
+  getGreeting,
+  buildFullConversationMessages,
+};

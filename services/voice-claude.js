@@ -1,4 +1,5 @@
 const Anthropic = require('@anthropic-ai/sdk');
+const { buildFullConversationMessages } = require('./claude');
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─── VOICE SYSTEM PROMPT ──────────────────────────────────────────────────────
@@ -99,7 +100,7 @@ CRITICAL:
 - If you don't have enough info, keep chatting — don't rush.`;
 
 // ─── IN-MEMORY CALL SESSIONS ─────────────────────────────────────────────────
-// Active calls stored here. Saved to MongoDB when call ends.
+// Active calls stored here. MongoDB transcript/score syncs after each /respond; finalized on call end.
 const activeCalls = new Map();
 
 function getCallSession(callSid) {
@@ -122,30 +123,19 @@ function deleteCallSession(callSid) {
   return session;
 }
 
-// ─── BUILD MEMORY CONTEXT ─────────────────────────────────────────────────────
-function buildMemoryContext(previousConversations) {
+// Prior chat + voice transcripts are injected into the API `messages` via buildFullConversationMessages
+// (full multi-turn history, same pattern as web chat). System prompt only gets a short pointer so we do not duplicate.
+function buildVoiceHistoryInstruction(previousConversations) {
   if (!previousConversations || previousConversations.length === 0) return '';
 
-  let memory = '\n\n--- RETURNING CUSTOMER HISTORY ---\n';
-  memory += `This customer has contacted us ${previousConversations.length} time(s) before.\n\n`;
+  const voiceCount = previousConversations.filter((c) => c.channel === 'voice').length;
+  const chatCount = previousConversations.length - voiceCount;
 
-  previousConversations.forEach((conv, idx) => {
-    memory += `PREVIOUS CONVERSATION ${idx + 1} (${new Date(conv.startedAt).toLocaleDateString()}):\n`;
-    const userMessages = conv.messages
-      .filter(m => m.role === 'user')
-      .map(m => m.content)
-      .join(' | ');
-    memory += `Customer said: ${userMessages.substring(0, 500)}\n`;
-
-    if (conv.quote && conv.quote.priceMin) {
-      memory += `Quote given: $${conv.quote.priceMin.toLocaleString()} – $${conv.quote.priceMax.toLocaleString()}\n`;
-      memory += `Details: ${JSON.stringify(conv.quote.details)}\n`;
-    }
-    memory += '\n';
-  });
-
-  memory += '--- END OF HISTORY ---\nReference this naturally.\n';
-  return memory;
+  return `\n\n--- PRIOR SAVED TRANSCRIPTS (in your message thread) ---\n` +
+    `The conversation messages below begin with ${previousConversations.length} complete earlier session(s) ` +
+    `(${chatCount} non-voice / ${voiceCount} voice), oldest sessions first — full customer + Alex transcript from our database. ` +
+    `After that block, the rest is THIS phone call. Use that history for continuity; still follow phone rules (short replies, one question).\n` +
+    `---\n`;
 }
 
 // ─── VOICE CHAT FUNCTION ──────────────────────────────────────────────────────
@@ -167,15 +157,15 @@ async function voiceChat(callSid, userSpeech) {
     session.messages.push({ role: 'user', content: userSpeech });
   }
 
-  // Build system prompt with memory
-  const memoryContext = buildMemoryContext(session.previousConversations);
-  const systemPrompt = VOICE_SYSTEM_PROMPT + memoryContext;
+  const historyInstruction = buildVoiceHistoryInstruction(session.previousConversations);
+  const systemPrompt = VOICE_SYSTEM_PROMPT + historyInstruction;
+  const apiMessages = buildFullConversationMessages(session.messages, session.previousConversations);
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 200, // Shorter = faster response time
     system: systemPrompt,
-    messages: session.messages.map(m => ({ role: m.role, content: m.content }))
+    messages: apiMessages
   });
 
   const fullText = response.content[0].text;
@@ -237,5 +227,5 @@ module.exports = {
   deleteCallSession,
   activeCalls,
   VOICE_SYSTEM_PROMPT,
-  buildMemoryContext,
+  buildVoiceHistoryInstruction,
 };

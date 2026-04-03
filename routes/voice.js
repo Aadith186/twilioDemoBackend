@@ -66,6 +66,95 @@ function escapeXml(str) {
     .replace(/"/g, '&quot;');
 }
 
+function mapSessionMessagesToSchema(session) {
+  return session.messages.map((m) => ({
+    role: m.role,
+    content: m.content,
+    timestamp: m.timestamp || new Date(),
+  }));
+}
+
+/**
+ * After each voice turn: sync transcript to Mongo, refresh lead score & summary (requirements).
+ * Does not block the Twilio HTTP response — call with void persistVoiceTurn(...).catch(...).
+ */
+async function persistVoiceTurn(req, callSid) {
+  const session = voiceClaude.getCallSession(callSid);
+  if (!session || session.messages.length === 0) return;
+
+  try {
+    const conversation = await Conversation.findOne({ sessionId: callSid });
+    if (!conversation) {
+      console.warn(`[Voice] persistVoiceTurn: no Conversation for ${callSid}`);
+      return;
+    }
+
+    conversation.messages = mapSessionMessagesToSchema(session);
+    if (session.quote) conversation.quote = session.quote;
+    await conversation.save();
+
+    let lead =
+      (session.leadId && (await Lead.findById(session.leadId))) ||
+      (session.callerPhone && session.callerPhone !== 'unknown'
+        ? await Lead.findOne({ phone: session.callerPhone })
+        : null);
+    if (!lead) return;
+
+    lead.lastSeen = new Date();
+    if (session.callerPhone && session.callerPhone !== 'unknown') {
+      lead.phone = session.callerPhone;
+    }
+    await lead.save();
+
+    const userMessages = session.messages.filter((m) => m.role === 'user');
+    if (userMessages.length < 1) return;
+
+    const previousConversations = await Conversation.find({
+      _id: {
+        $in: lead.conversations.filter((id) => id.toString() !== conversation._id.toString()),
+      },
+      status: 'ended',
+    }).sort({ startedAt: 1 });
+
+    const scoreData = await claudeService.scoreLead(
+      session.messages,
+      lead.name,
+      previousConversations
+    );
+
+    lead.score = scoreData.score;
+    if (scoreData.scoreBreakdown) lead.scoreBreakdown = scoreData.scoreBreakdown;
+    if (scoreData.requirements) lead.requirements = scoreData.requirements;
+    if (scoreData.name && lead.name === 'Unknown') lead.name = scoreData.name;
+    if (scoreData.email && !lead.email) lead.email = scoreData.email;
+    if (scoreData.company && !lead.company) lead.company = scoreData.company;
+    await lead.save();
+
+    const io = req.app.get('io');
+    if (io) {
+      io.to('admin').emit('lead_score_updated', {
+        leadId: lead._id.toString(),
+        name: lead.name,
+        score: lead.score,
+        tier: lead.tier,
+        scoreBreakdown: lead.scoreBreakdown,
+        requirements: lead.requirements,
+        quote: session.quote,
+        channel: 'voice',
+      });
+      io.to('admin').emit('voice_transcript_updated', {
+        leadId: lead._id.toString(),
+        conversationId: conversation._id.toString(),
+        sessionId: callSid,
+        messages: conversation.messages,
+        channel: 'voice',
+      });
+    }
+  } catch (err) {
+    console.error('[Voice] persistVoiceTurn error:', err.message || err);
+  }
+}
+
 // ─── INCOMING CALL ────────────────────────────────────────────────────────────
 // Twilio hits this when someone calls your number
 router.post('/incoming', async (req, res) => {
@@ -92,39 +181,78 @@ router.post('/incoming', async (req, res) => {
 
       session.leadId = lead._id.toString();
 
-      // Load past conversations for memory
-      const convIds = lead.conversations.slice(-3);
+      // Full saved history (chat + voice), same breadth as web chat — feeds model message thread each turn
       const previousConversations = await Conversation.find({
-        _id: { $in: convIds },
-        status: 'ended'
-      }).sort({ startedAt: -1 });
+        leadId: lead._id,
+        status: 'ended',
+      }).sort({ startedAt: 1 });
       session.previousConversations = previousConversations;
 
-      // Personalized greeting
-      if (lead.name && lead.name !== 'Unknown') {
-        greeting = `Hey ${lead.name}! Good to hear from you again. Welcome back to Steel Building Depot. How can I help you today?`;
-      } else {
-        greeting = `Hey, welcome back to Steel Building Depot! Good to hear from you again. What can I help you with today?`;
+      // Returning caller greeting with previous-conversation summary (same style as chat).
+      try {
+        greeting = await claudeService.getGreeting(
+          true,
+          lead.name,
+          previousConversations
+        );
+      } catch (greetErr) {
+        console.error('[Voice] Returning greeting generation error:', greetErr.message);
+        if (lead.name && lead.name !== 'Unknown') {
+          greeting = `Hey ${lead.name}! Good to hear from you again. Welcome back to Steel Building Depot. How can I help you today?`;
+        } else {
+          greeting = `Hey, welcome back to Steel Building Depot! Good to hear from you again. What can I help you with today?`;
+        }
       }
     } else {
-      // New caller
+      // New caller — create lead immediately so each turn can sync to DB
+      lead = new Lead({
+        phone: callerPhone !== 'unknown' ? callerPhone : undefined,
+        lastSeen: new Date(),
+        firstSeen: new Date(),
+      });
+      await lead.save();
+      session.leadId = lead._id.toString();
       greeting = `Hey there! Thanks for calling Steel Building Depot. I'm Alex, I'll be helping you out today. Before we get into things... could I get your name?`;
     }
 
     // Store greeting in session
-    session.messages.push({ role: 'assistant', content: greeting });
+    session.messages.push({ role: 'assistant', content: greeting, timestamp: new Date() });
+
+    // Active conversation for this call (transcript updated after each /respond)
+    const conversation = new Conversation({
+      leadId: lead._id,
+      sessionId: callSid,
+      messages: mapSessionMessagesToSchema(session),
+      status: 'active',
+      channel: 'voice',
+      startedAt: session.startedAt,
+    });
+    await conversation.save();
+    lead.conversations.push(conversation._id);
+    lead.totalConversations = lead.conversations.length;
+    lead.lastSeen = new Date();
+    await lead.save();
 
     // Notify admin panel
-    if (req.app.get('io')) {
-      req.app.get('io').to('admin').emit('new_lead_activity', {
-        leadId: session.leadId,
-        name: lead?.name || 'New Caller',
+    const io = req.app.get('io');
+    if (io) {
+      io.to('admin').emit('new_lead_activity', {
+        leadId: lead._id.toString(),
+        conversationId: conversation._id.toString(),
+        name: lead.name || 'New Caller',
         isReturning,
-        tier: lead?.tier || 'new',
-        score: lead?.score || 0,
+        tier: lead.tier || 'new',
+        score: lead.score || 0,
         channel: 'voice',
         phone: callerPhone,
         timestamp: new Date(),
+      });
+      io.to('admin').emit('voice_transcript_updated', {
+        leadId: lead._id.toString(),
+        conversationId: conversation._id.toString(),
+        sessionId: callSid,
+        messages: conversation.messages,
+        channel: 'voice',
       });
     }
 
@@ -174,8 +302,11 @@ router.post('/respond', async (req, res) => {
       console.log(`[Voice] Quote generated: $${quoteData.priceMin} - $${quoteData.priceMax}`);
     }
 
-    // Return TwiML with Claude's response
+    // Return TwiML with Claude's response first — DB sync runs in background
     buildTwiML(res, text, req);
+    void persistVoiceTurn(req, callSid).catch((e) =>
+      console.error('[Voice] persistVoiceTurn failed:', e.message || e)
+    );
 
   } catch (err) {
     console.error('[Voice] Respond error:', err);
@@ -201,11 +332,11 @@ router.post('/listen', (req, res) => {
 });
 
 // ─── CALL STATUS CALLBACK ─────────────────────────────────────────────────────
-// Twilio hits this when the call ends. We save everything to MongoDB.
+// Twilio hits this when the call ends. Finalize the active Conversation (synced each /respond).
 router.post('/status', async (req, res) => {
   const callSid = req.body.CallSid;
   const callStatus = req.body.CallStatus;
-  const callDuration = parseInt(req.body.CallDuration || '0');
+  const callDuration = parseInt(req.body.CallDuration || '0', 10);
   const callerPhone = req.body.From || 'unknown';
 
   console.log(`[Voice] Call ${callSid} status: ${callStatus}, duration: ${callDuration}s`);
@@ -216,15 +347,55 @@ router.post('/status', async (req, res) => {
   }
 
   try {
-    // Get session data
     const session = voiceClaude.deleteCallSession(callSid);
+    const conversation = await Conversation.findOne({ sessionId: callSid });
 
-    if (!session || session.messages.length === 0) {
-      console.log(`[Voice] No session data for ${callSid}, skipping save.`);
+    if (conversation && session && session.messages.length > 0) {
+      conversation.messages = mapSessionMessagesToSchema(session);
+      if (session.quote) conversation.quote = session.quote;
+      conversation.status = 'ended';
+      conversation.endedAt = new Date();
+      if (callDuration) conversation.callDuration = callDuration;
+      await conversation.save();
+
+      const lead = await Lead.findById(conversation.leadId);
+      if (lead) {
+        lead.lastSeen = new Date();
+        if (callerPhone !== 'unknown') lead.phone = callerPhone;
+        await lead.save();
+      }
+
+      const io = req.app.get('io');
+      if (io) {
+        io.to('admin').emit('voice_transcript_updated', {
+          leadId: conversation.leadId.toString(),
+          conversationId: conversation._id.toString(),
+          sessionId: callSid,
+          messages: conversation.messages,
+          channel: 'voice',
+        });
+      }
+
+      console.log(
+        `[Voice] Call finalized. Lead: ${lead?.name || '?'} (${lead?._id}), Messages: ${session.messages.length}`
+      );
       return res.json({ ok: true });
     }
 
-    // Find or create lead
+    if (conversation && (!session || session.messages.length === 0)) {
+      conversation.status = 'ended';
+      conversation.endedAt = new Date();
+      if (callDuration) conversation.callDuration = callDuration;
+      await conversation.save();
+      console.log(`[Voice] Call finalized (no session). Conversation ${conversation._id}`);
+      return res.json({ ok: true });
+    }
+
+    if (!session || session.messages.length === 0) {
+      console.log(`[Voice] No session for ${callSid}; nothing to merge.`);
+      return res.json({ ok: true });
+    }
+
     let lead;
     if (session.leadId) {
       lead = await Lead.findById(session.leadId);
@@ -241,38 +412,32 @@ router.post('/status', async (req, res) => {
       await lead.save();
     }
 
-    // Create conversation record
-    const conversation = new Conversation({
+    const newConv = new Conversation({
       leadId: lead._id,
       sessionId: callSid,
-      messages: session.messages.map(m => ({
-        role: m.role,
-        content: m.content,
-        timestamp: m.timestamp || new Date()
-      })),
+      messages: mapSessionMessagesToSchema(session),
       quote: session.quote || undefined,
       status: 'ended',
       startedAt: session.startedAt,
       endedAt: new Date(),
       channel: 'voice',
-      callDuration: callDuration,
+      callDuration: callDuration || undefined,
     });
-    await conversation.save();
-
-    // Link to lead
-    lead.conversations.push(conversation._id);
+    await newConv.save();
+    lead.conversations.push(newConv._id);
     lead.totalConversations = lead.conversations.length;
     lead.lastSeen = new Date();
     if (callerPhone !== 'unknown') lead.phone = callerPhone;
     await lead.save();
 
-    // Score the lead if there were enough messages
-    const userMessages = session.messages.filter(m => m.role === 'user');
-    if (userMessages.length >= 2) {
+    const userMessages = session.messages.filter((m) => m.role === 'user');
+    if (userMessages.length >= 1) {
       try {
         const previousConversations = await Conversation.find({
-          _id: { $in: lead.conversations.filter(id => id.toString() !== conversation._id.toString()) },
-          status: 'ended'
+          _id: {
+            $in: lead.conversations.filter((id) => id.toString() !== newConv._id.toString()),
+          },
+          status: 'ended',
         }).sort({ startedAt: 1 });
 
         const scoreData = await claudeService.scoreLead(
@@ -280,7 +445,6 @@ router.post('/status', async (req, res) => {
           lead.name,
           previousConversations
         );
-
         lead.score = scoreData.score;
         if (scoreData.scoreBreakdown) lead.scoreBreakdown = scoreData.scoreBreakdown;
         if (scoreData.requirements) lead.requirements = scoreData.requirements;
@@ -289,11 +453,9 @@ router.post('/status', async (req, res) => {
         if (scoreData.company && !lead.company) lead.company = scoreData.company;
         await lead.save();
 
-        console.log(`[Voice] Lead scored: ${lead.name} = ${lead.score} (${lead.tier})`);
-
-        // Notify admin panel
-        if (req.app.get('io')) {
-          req.app.get('io').to('admin').emit('lead_score_updated', {
+        const io = req.app.get('io');
+        if (io) {
+          io.to('admin').emit('lead_score_updated', {
             leadId: lead._id.toString(),
             name: lead.name,
             score: lead.score,
@@ -305,13 +467,14 @@ router.post('/status', async (req, res) => {
           });
         }
       } catch (err) {
-        console.error('[Voice] Scoring error:', err.message);
+        console.error('[Voice] Fallback scoring error:', err.message);
       }
     }
 
-    console.log(`[Voice] Call saved. Lead: ${lead.name} (${lead._id}), Messages: ${session.messages.length}`);
+    console.log(
+      `[Voice] Call saved (fallback). Lead: ${lead.name} (${lead._id}), Messages: ${session.messages.length}`
+    );
     res.json({ ok: true });
-
   } catch (err) {
     console.error('[Voice] Status callback error:', err);
     res.json({ ok: true }); // Always 200 to Twilio
