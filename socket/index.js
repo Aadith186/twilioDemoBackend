@@ -114,6 +114,36 @@ module.exports = function setupSockets(io) {
           }
         }
 
+        // Determine prior chat history behavior (skip greeting if user chatted recently).
+        const hadPriorConversations =
+          isReturning &&
+          Array.isArray(previousConversationIds) &&
+          previousConversationIds.length > 0;
+
+        let priorEndedConversations = [];
+        let lastMessageAt = null;
+        if (hadPriorConversations) {
+          priorEndedConversations = await Conversation.find({
+            _id: { $in: previousConversationIds },
+            status: 'ended'
+          }).sort({ startedAt: -1 });
+
+          // Find last interaction timestamp across all prior conversations.
+          for (const conv of priorEndedConversations) {
+            const convLast = (conv.messages || [])
+              .map((m) => m?.timestamp ? new Date(m.timestamp).getTime() : new Date(conv.startedAt).getTime())
+              .reduce((max, t) => Math.max(max, t), -Infinity);
+            if (convLast !== -Infinity) {
+              if (!lastMessageAt) lastMessageAt = new Date(convLast);
+              else if (convLast > lastMessageAt.getTime()) lastMessageAt = new Date(convLast);
+            }
+          }
+        }
+
+        const shouldSendLongGapGreeting =
+          lastMessageAt &&
+          Date.now() - lastMessageAt.getTime() > RESUME_CONVERSATION_MS;
+
         // Create new conversation
         const conversation = new Conversation({
           leadId: lead._id,
@@ -131,23 +161,23 @@ module.exports = function setupSockets(io) {
         socket.leadId = lead._id.toString();
         socket.conversationId = conversation._id.toString();
 
-        // Returning users who already have chat history see prior messages via history_loaded;
-        // start a fresh thread with no assistant greeting so they can type first.
-        const hadPriorConversations =
-          isReturning && Array.isArray(previousConversationIds) && previousConversationIds.length > 0;
-
-        const greeting =
-          isReturning && lead.name && lead.name !== 'Unknown'
-            ? `Welcome back ${lead.name}! I am Alex from Steel Building Depot. How can I help today?`
-            : "Hi there! Welcome to Steel Building Depot. I'm Alex, and I'm here to help with your building estimate. Could I get your name?";
-
-        let greetingToSend = greeting;
-        if (hadPriorConversations) {
-          greetingToSend = null;
-        } else {
-          conversation.messages.push({ role: 'assistant', content: greeting });
+        let greetingToSend = null;
+        if (!hadPriorConversations) {
+          // New lead: regular welcome + ask name
+          greetingToSend =
+            isReturning && lead.name && lead.name !== 'Unknown'
+              ? `Welcome back ${lead.name}! I am Alex from Steel Building Depot. How can I help today?`
+              : "Hi there! Welcome to Steel Building Depot. I'm Alex, and I'm here to help with your building estimate. Could I get your name?";
+          conversation.messages.push({ role: 'assistant', content: greetingToSend });
+          await conversation.save();
+        } else if (shouldSendLongGapGreeting) {
+          // Returning user but last chat was > 30 minutes ago: send a short follow-up
+          greetingToSend = lead.name && lead.name !== 'Unknown'
+            ? `Hey ${lead.name}, we have left here for a bit — what type of project are you planning?`
+            : `Hey, we have left here for a bit — what type of project are you planning?`;
+          conversation.messages.push({ role: 'assistant', content: greetingToSend });
+          await conversation.save();
         }
-        await conversation.save();
 
         socket.emit('session_started', {
           sessionId: sid,
@@ -158,29 +188,19 @@ module.exports = function setupSockets(io) {
           greeting: greetingToSend
         });
 
-        // Send previous history after session is ready (non-blocking)
-        if (previousConversationIds.length) {
-          Conversation.find({
-            _id: { $in: previousConversationIds },
-            status: 'ended'
-          })
-            .sort({ startedAt: -1 })
-            .then((previousConversations) => {
-              const historyMessages = previousConversations
-                .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
-                .flatMap((conv) =>
-                  (conv.messages || []).map((m) => ({
-                    role: m.role,
-                    content: m.content,
-                    timestamp: m.timestamp || conv.startedAt,
-                    quote: m.quote || null
-                  }))
-                );
-              socket.emit('history_loaded', { historyMessages });
-            })
-            .catch((err) => {
-              console.error('history_loaded error:', err);
-            });
+        // Send previous history after session is ready
+        if (priorEndedConversations.length) {
+          const historyMessages = priorEndedConversations
+            .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
+            .flatMap((conv) =>
+              (conv.messages || []).map((m) => ({
+                role: m.role,
+                content: m.content,
+                timestamp: m.timestamp || conv.startedAt,
+                quote: m.quote || null
+              }))
+            );
+          socket.emit('history_loaded', { historyMessages });
         }
 
         // Notify admin of new session
