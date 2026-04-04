@@ -1,5 +1,5 @@
 const Anthropic = require('@anthropic-ai/sdk');
-const { PROJECT_LIFECYCLE_STAGES } = require('../models');
+const { PROJECT_LIFECYCLE_STAGES, Conversation } = require('../models');
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -10,7 +10,7 @@ REGISTER (critical — sound human, not like a friend and not like a bot):
 - You are a competent sales professional talking to a customer or prospect: respectful, clear, and pleasant — never buddy-buddy, never cold or stiff
 - NOT too casual: do not sound like texting a friend. Avoid "What's up", "Hey [Name]!" as a whole opener, "sup", "yo", "dude", "man", "no worries", "cool cool", or slangy check-ins
 - NOT too formal: avoid "Dear Sir/Madam", "I would be delighted to", "per your inquiry", "kindly advise", "at your earliest convenience" — that's corporate-AI or legal tone
-- Sweet spot: calm, direct, business-appropriate warmth — like a good account exec on a Zoom who knows their product. Example tone: "Hi Akshay — thanks for reaching out. To point you in the right direction, what kind of build are you looking at?"
+- Sweet spot: calm, direct, business-appropriate warmth — like a good account exec on a Zoom who knows their product: real reactions, plain words, no brochure-speak. Example tone: "Hi Akshay — thanks for reaching out. To point you in the right direction, what kind of build are you looking at?"
 - Greetings: prefer "Hi [Name]," or "Good morning [Name]," over "Hey!" Open with purpose (why you're chatting / next step), not small talk
 - Short, natural sentences. Skip filler ("I'm here to help", "Feel free to ask", "Let me know if you need anything else", "I'm still here")
 - Never repeat the same acknowledgment or opener across messages. Vary: Okay / Right / Makes sense / Sounds good / I follow / Thanks for that / Got it (don't lean on one word every time)
@@ -90,54 +90,100 @@ IMPORTANT RULES:
 function buildMemoryContext(previousConversations) {
   if (!previousConversations || previousConversations.length === 0) return '';
 
-  let memory = '\n\n--- RETURNING CUSTOMER HISTORY ---\n';
-  memory += `This customer has chatted with us ${previousConversations.length} time(s) before.\n\n`;
+  const quoteHints = previousConversations
+    .map((conv, idx) => {
+      if (!conv.quote || conv.quote.priceMin == null) return null;
+      return `Session ${idx + 1}: $${conv.quote.priceMin.toLocaleString()} – $${conv.quote.priceMax.toLocaleString()}`;
+    })
+    .filter(Boolean);
 
-  previousConversations.forEach((conv, idx) => {
-    memory += `PREVIOUS CONVERSATION ${idx + 1} (${new Date(conv.startedAt).toLocaleDateString()}):\n`;
-
-    // Add transcript summary
-    const userMessages = conv.messages
-      .filter(m => m.role === 'user')
-      .map(m => m.content)
-      .join(' | ');
-    memory += `Customer said: ${userMessages.substring(0, 500)}\n`;
-
-    // Add quote if exists
-    if (conv.quote && conv.quote.priceMin) {
-      memory += `Quote given: $${conv.quote.priceMin.toLocaleString()} – $${conv.quote.priceMax.toLocaleString()}\n`;
-      memory += `Project details: ${JSON.stringify(conv.quote.details)}\n`;
-      memory += `Complexity grade: ${conv.quote.complexity}/5\n`;
-    }
-    memory += '\n';
-  });
-
-  memory += '--- END OF HISTORY ---\n\n';
-  memory += 'Use this history naturally in conversation. Reference previous projects and quotes when relevant.\n';
+  let memory = '\n\n--- RETURNING CUSTOMER ---\n';
+  memory += `This lead has ${previousConversations.length} earlier conversation(s) in the message thread below (oldest first), each labeled — full user + Alex transcript. Use all of it for continuity.\n`;
+  if (quoteHints.length) memory += `Saved quotes from prior sessions: ${quoteHints.join('; ')}.\n`;
+  memory += 'Reference prior projects and numbers naturally; do not re-ask for details already in that thread.\n';
   return memory;
 }
 
-function buildFullConversationMessages(currentMessages, previousConversations = []) {
-  const historicalMessages = previousConversations
-    .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
-    .flatMap((conv) =>
-      (conv.messages || [])
-        .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
-        .map((m) => ({ role: m.role, content: m.content }))
-    );
+/**
+ * Load every Conversation row for this lead with full embedded messages (not just lead.conversations[]).
+ * Excludes the active thread by conversation _id or Twilio CallSid (web sessionId).
+ */
+async function fetchAllPriorConversationsForLead(leadId, { excludeConversationId, excludeSessionId } = {}) {
+  if (leadId == null || leadId === '') return [];
+  let excludeId = excludeConversationId;
+  if (excludeSessionId != null && String(excludeSessionId).trim() !== '' && excludeId == null) {
+    const cur = await Conversation.findOne({ sessionId: String(excludeSessionId) }).select('_id').lean();
+    if (cur && cur._id) excludeId = cur._id;
+  }
+  const filter = { leadId };
+  if (excludeId != null) filter._id = { $ne: excludeId };
+  return Conversation.find(filter).sort({ startedAt: 1 }).lean();
+}
+
+/**
+ * Anthropic expects alternating user/assistant turns; stitched DB history can start with assistant (greeting)
+ * or have consecutive same-role lines. Merge consecutive same role so the API always gets valid alternation.
+ */
+function ensureAnthropicMessageAlternation(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    if (!m || !m.content || (m.role !== 'user' && m.role !== 'assistant')) continue;
+    const msg = { role: m.role, content: String(m.content).trim() };
+    if (!msg.content) continue;
+    if (out.length === 0) {
+      if (msg.role === 'assistant') {
+        out.push({ role: 'user', content: '(Customer joined after your earlier welcome in a prior session.)' });
+      }
+      out.push(msg);
+      continue;
+    }
+    const last = out[out.length - 1];
+    if (last.role === msg.role) {
+      last.content = `${last.content}\n\n${msg.content}`;
+    } else {
+      out.push(msg);
+    }
+  }
+  return out;
+}
+
+function buildFullConversationMessages(currentMessages, previousConversations = [], options = {}) {
+  const labelPriorSessions = options.labelPriorSessions === true;
+  const sorted = [...(previousConversations || [])].sort(
+    (a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime()
+  );
+
+  const historicalMessages = sorted.flatMap((conv) => {
+    const rows = (conv.messages || [])
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
+      .map((m, idx) => {
+        let content = String(m.content);
+        if (labelPriorSessions && idx === 0) {
+          const ch = conv.channel === 'voice' ? 'phone call' : 'web chat';
+          const when = conv.startedAt
+            ? new Date(conv.startedAt).toISOString().slice(0, 19).replace('T', ' ')
+            : 'unknown date';
+          content = `--- Prior ${ch} (${when}) — transcript below ---\n${content}`;
+        }
+        return { role: m.role, content };
+      });
+    return rows;
+  });
 
   const liveMessages = (currentMessages || [])
     .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
     .map((m) => ({ role: m.role, content: m.content }));
 
-  return [...historicalMessages, ...liveMessages];
+  return ensureAnthropicMessageAlternation([...historicalMessages, ...liveMessages]);
 }
 
 // ─── MAIN CHAT FUNCTION ───────────────────────────────────────────────────────
 async function chat(messages, previousConversations = []) {
   const memoryContext = buildMemoryContext(previousConversations);
   const systemWithMemory = SALES_SYSTEM_PROMPT + memoryContext;
-  const fullContextMessages = buildFullConversationMessages(messages, previousConversations);
+  const fullContextMessages = buildFullConversationMessages(messages, previousConversations, {
+    labelPriorSessions: true,
+  });
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
@@ -285,26 +331,40 @@ ${transcript}`
 }
 
 // ─── GREETING MESSAGE ─────────────────────────────────────────────────────────
-async function getGreeting(isReturning, leadName, previousConversations = []) {
+async function getGreeting(isReturning, leadName, previousConversations = [], options = {}) {
+  const forVoice = options.channel === 'voice';
+
   if (isReturning && (leadName || previousConversations?.length > 0)) {
-    let contextPrompt = `[SYSTEM: Generate a brief welcome-back message for a returning customer — tone: professional sales executive (warm, not casual: no "what's up" or buddy slang)`;
-    if (leadName && leadName !== 'Unknown') contextPrompt += ` named ${leadName}`;
-    contextPrompt += `. `;
+    let contextPrompt = forVoice
+      ? `[SYSTEM: You are Alex on a LIVE PHONE CALL at Steel Building Depot. Generate a short spoken welcome-back — sounds like a real person on the phone, not a chatbot or email.`
+      : `[SYSTEM: Generate a brief welcome-back message for a returning customer — tone: professional sales executive (warm, not casual: no "what's up" or buddy slang)`;
+    if (leadName && leadName !== 'Unknown') contextPrompt += ` The customer's name is ${leadName}.`;
+    contextPrompt += ` `;
 
     if (previousConversations && previousConversations.length > 0) {
+      const cap = forVoice ? 1200 : 400;
       const summary = previousConversations.map((c, i) => {
-        const userMsgs = c.messages?.filter(m => m.role === 'user').map(m => m.content).join(' | ') || '';
+        const lines = (c.messages || [])
+          .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
+          .map((m) => `${m.role === 'user' ? 'Customer' : 'Alex'}: ${m.content}`);
+        const body = lines.join(' ').substring(0, cap);
         const quote = c.quote?.priceMin ? ` (Quote: $${c.quote.priceMin.toLocaleString()}-$${c.quote.priceMax.toLocaleString()})` : '';
-        return `Visit ${i + 1}: ${userMsgs.substring(0, 200)}${quote}`;
+        return `Session ${i + 1}: ${body}${quote}`;
       }).join('\n');
-      contextPrompt += `You remember their previous chat(s). Use this context to reference what they discussed:\n${summary}\n\n`;
+      contextPrompt += `They have talked with us before. Use this so you sound like you remember (be specific — project type, location, numbers they gave, quote if any):\n${summary}\n\n`;
     }
-    contextPrompt += `Keep greeting to 2 short sentences max. Tone: professional sales executive — warm but not casual (no "what's up", no buddy slang). Reference their prior project or quote if relevant. End with one clear next step or question.]`;
+    contextPrompt += forVoice
+      ? `Rules: 1–2 short sentences only, no bullets or lists, no markdown, no emoji. Sound relaxed and human (contractions OK). Mention something concrete from prior chats if you have it; otherwise warm generic welcome-back. One natural follow-up question. End there.]`
+      : `Keep greeting to 2 short sentences max. Tone: professional sales executive — warm but not casual (no "what's up", no buddy slang). Reference their prior project or quote if relevant. End with one clear next step or question.]`;
+
+    const systemForGreeting = forVoice
+      ? `You write brief, natural phone dialogue for a steel building sales rep. Never robotic, never corporate-AI. No markdown.`
+      : SALES_SYSTEM_PROMPT;
 
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 256,
-      system: SALES_SYSTEM_PROMPT,
+      max_tokens: forVoice ? 180 : 256,
+      system: systemForGreeting,
       messages: [{ role: 'user', content: contextPrompt }]
     });
     return response.content[0].text;
@@ -318,6 +378,7 @@ module.exports = {
   scoreLead,
   getGreeting,
   buildFullConversationMessages,
+  fetchAllPriorConversationsForLead,
   applyScoreDataToLead,
   PROJECT_LIFECYCLE_STAGES,
 };

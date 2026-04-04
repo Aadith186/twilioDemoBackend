@@ -20,15 +20,12 @@ module.exports = function setupSockets(io) {
         // Check for returning lead by fingerprint/sessionId
         let lead = null;
         let isReturning = false;
-        let previousConversationIds = [];
 
         if (fingerprint) {
           // Try to find existing lead by stored leadId in fingerprint
           lead = await Lead.findById(fingerprint).catch(() => null);
           if (lead) {
             isReturning = true;
-            // Keep full prior conversation history for context + history rendering
-            previousConversationIds = [...lead.conversations];
 
             // Update last seen
             lead.lastSeen = new Date();
@@ -85,58 +82,42 @@ module.exports = function setupSockets(io) {
               messages: uiMessages
             });
 
-            const otherIds = lead.conversations
-              .filter((id) => id.toString() !== existing._id.toString())
-              .map((id) => id);
-            if (otherIds.length) {
-              Conversation.find({
-                _id: { $in: otherIds },
-                status: 'ended'
+            claudeService
+              .fetchAllPriorConversationsForLead(lead._id, {
+                excludeConversationId: existing._id,
               })
-                .sort({ startedAt: -1 })
-                .then((previousConversations) => {
-                  const historyMessages = previousConversations
-                    .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
-                    .flatMap((conv) =>
-                      (conv.messages || []).map((m) => ({
-                        role: m.role,
-                        content: m.content,
-                        timestamp: m.timestamp || conv.startedAt,
-                        quote: m.quote || null
-                      }))
-                    );
-                  socket.emit('history_loaded', { historyMessages });
-                })
-                .catch((err) => console.error('history_loaded error:', err));
-            }
+              .then((previousConversations) => {
+                if (!previousConversations.length) return;
+                const historyMessages = previousConversations
+                  .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
+                  .flatMap((conv) =>
+                    (conv.messages || []).map((m) => ({
+                      role: m.role,
+                      content: m.content,
+                      timestamp: m.timestamp || conv.startedAt,
+                      quote: m.quote || null
+                    }))
+                  );
+                socket.emit('history_loaded', { historyMessages });
+              })
+              .catch((err) => console.error('history_loaded error:', err));
 
             return;
           }
         }
 
-        // Determine prior chat history behavior (skip greeting if user chatted recently).
-        const hadPriorConversations =
-          isReturning &&
-          Array.isArray(previousConversationIds) &&
-          previousConversationIds.length > 0;
+        // All conversations for this lead (by leadId), full messages — not only lead.conversations[]
+        const priorOtherConversations = await claudeService.fetchAllPriorConversationsForLead(lead._id, {});
+        const hadPriorConversations = isReturning && priorOtherConversations.length > 0;
 
-        let priorEndedConversations = [];
         let lastMessageAt = null;
-        if (hadPriorConversations) {
-          priorEndedConversations = await Conversation.find({
-            _id: { $in: previousConversationIds },
-            status: 'ended'
-          }).sort({ startedAt: -1 });
-
-          // Find last interaction timestamp across all prior conversations.
-          for (const conv of priorEndedConversations) {
-            const convLast = (conv.messages || [])
-              .map((m) => m?.timestamp ? new Date(m.timestamp).getTime() : new Date(conv.startedAt).getTime())
-              .reduce((max, t) => Math.max(max, t), -Infinity);
-            if (convLast !== -Infinity) {
-              if (!lastMessageAt) lastMessageAt = new Date(convLast);
-              else if (convLast > lastMessageAt.getTime()) lastMessageAt = new Date(convLast);
-            }
+        for (const conv of priorOtherConversations) {
+          const convLast = (conv.messages || [])
+            .map((m) => (m?.timestamp ? new Date(m.timestamp).getTime() : new Date(conv.startedAt).getTime()))
+            .reduce((max, t) => Math.max(max, t), -Infinity);
+          if (convLast !== -Infinity) {
+            if (!lastMessageAt) lastMessageAt = new Date(convLast);
+            else if (convLast > lastMessageAt.getTime()) lastMessageAt = new Date(convLast);
           }
         }
 
@@ -189,8 +170,8 @@ module.exports = function setupSockets(io) {
         });
 
         // Send previous history after session is ready
-        if (priorEndedConversations.length) {
-          const historyMessages = priorEndedConversations
+        if (priorOtherConversations.length) {
+          const historyMessages = priorOtherConversations
             .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
             .flatMap((conv) =>
               (conv.messages || []).map((m) => ({
@@ -237,14 +218,10 @@ module.exports = function setupSockets(io) {
         // Emit typing indicator
         socket.emit('ai_typing', true);
 
-        // Load previous conversations for memory
-        const prevConvIds = lead.conversations.filter(
-          id => id.toString() !== socket.conversationId
-        );
-        const previousConversations = await Conversation.find({
-          _id: { $in: prevConvIds },
-          status: 'ended'
-        }).sort({ startedAt: 1 });
+        // All other conversations for this lead (full messages), not only lead.conversations[]
+        const previousConversations = await claudeService.fetchAllPriorConversationsForLead(lead._id, {
+          excludeConversationId: conversation._id,
+        });
 
         // Get AI response
         const { text, quoteData } = await claudeService.chat(

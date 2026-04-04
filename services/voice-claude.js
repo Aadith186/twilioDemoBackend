@@ -1,5 +1,5 @@
 const Anthropic = require('@anthropic-ai/sdk');
-const { buildFullConversationMessages } = require('./claude');
+const { buildFullConversationMessages, fetchAllPriorConversationsForLead } = require('./claude');
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─── VOICE SYSTEM PROMPT ──────────────────────────────────────────────────────
@@ -79,7 +79,7 @@ India:
 - Tier 2 cities: roughly base or plus five percent
 
 MEMORY INSTRUCTIONS:
-If previous conversation history is provided, be natural about it: "Hey, good to hear from you again! Last time we talked about that warehouse project, right?" Be specific about past details.
+When prior sessions appear in the thread, treat them as real memory — use names, places, sqft, and quotes they actually mentioned. Sound like you remember: "Oh right, the Austin warehouse — we had you around forty to sixty K last time, yeah?" Never ask from scratch for details already in that history unless you need to confirm. Do not say you're "pulling up a file" or "according to our system" — just talk like you recall the conversation.
 
 END OF CALL:
 - If they seem ready to move forward: "Want me to have one of our senior estimators give you a call? They can do a proper site visit and get you a detailed quote."
@@ -93,6 +93,12 @@ The customer can interrupt you mid-sentence. When you see a note saying they int
 - Then respond to what they actually said
 - If they seem to be answering a question you asked (even if they cut you off), just roll with it
 - Keep it natural — people interrupt on real calls all the time
+
+SOUND HUMAN (not a phone tree or chatbot):
+- Vary how you start sentences; don't begin every reply with "Great," "Perfect," or "Absolutely."
+- It's OK to think out loud briefly: "Yeah, that tracks." / "Fair enough."
+- Never say "I appreciate you sharing that" or "Thank you for that information" — say "Got it" or "Okay, that helps."
+- Do not list options like a menu unless they sound spoken: "Was it more of a new build, or fixing up something existing?"
 
 CRITICAL:
 - Never make up details
@@ -142,6 +148,17 @@ function buildVoiceHistoryInstruction(previousConversations) {
 async function voiceChat(callSid, userSpeech) {
   const session = getCallSession(callSid);
 
+  // Reload from DB every turn: all conversations for this lead + every message (excludes this call only)
+  if (session.leadId) {
+    try {
+      session.previousConversations = await fetchAllPriorConversationsForLead(session.leadId, {
+        excludeSessionId: callSid,
+      });
+    } catch (err) {
+      console.error('[Voice] fetchAllPriorConversationsForLead:', err.message || err);
+    }
+  }
+
   // Detect possible interruption:
   // If the last message was from assistant, the user might have cut it off
   // (Twilio stops TTS when user speaks, then sends us what they said)
@@ -159,11 +176,13 @@ async function voiceChat(callSid, userSpeech) {
 
   const historyInstruction = buildVoiceHistoryInstruction(session.previousConversations);
   const systemPrompt = VOICE_SYSTEM_PROMPT + historyInstruction;
-  const apiMessages = buildFullConversationMessages(session.messages, session.previousConversations);
+  const apiMessages = buildFullConversationMessages(session.messages, session.previousConversations, {
+    labelPriorSessions: true,
+  });
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 200, // Shorter = faster response time
+    max_tokens: 280, // Enough for a natural 1–2 sentence reply without clipping
     system: systemPrompt,
     messages: apiMessages
   });

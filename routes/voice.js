@@ -48,7 +48,7 @@ function buildTwiML(res, sayText, req, isSSML = true) {
     <Say ${voiceAttr}>${sayContent}</Say>
   </Gather>
   <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="4" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
-    <Say ${voiceAttr}>I'm still here. Go ahead whenever you're ready.</Say>
+    <Say ${voiceAttr}>No rush — I'm here. Whenever you're ready.</Say>
   </Gather>
   <Say ${voiceAttr}>It seems like we lost each other. Feel free to call back anytime!</Say>
   <Hangup/>
@@ -64,6 +64,28 @@ function escapeXml(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/** Twilio From vs stored Lead.phone often differ (+1… vs digits) — try variants so returning callers hit the same lead. */
+function callerPhoneVariants(callerPhone) {
+  if (!callerPhone || callerPhone === 'unknown') return [];
+  const raw = String(callerPhone).trim();
+  const variants = new Set([raw]);
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    variants.add(last10);
+    variants.add(`+1${last10}`);
+    variants.add(`1${last10}`);
+    variants.add(`+${digits}`);
+  }
+  return [...variants];
+}
+
+async function findLeadByCallerPhone(callerPhone) {
+  const variants = callerPhoneVariants(callerPhone);
+  if (variants.length === 0) return null;
+  return Lead.findOne({ phone: { $in: variants } });
 }
 
 function mapSessionMessagesToSchema(session) {
@@ -96,7 +118,7 @@ async function persistVoiceTurn(req, callSid) {
     let lead =
       (session.leadId && (await Lead.findById(session.leadId))) ||
       (session.callerPhone && session.callerPhone !== 'unknown'
-        ? await Lead.findOne({ phone: session.callerPhone })
+        ? await findLeadByCallerPhone(session.callerPhone)
         : null);
     if (!lead) return;
 
@@ -109,12 +131,9 @@ async function persistVoiceTurn(req, callSid) {
     const userMessages = session.messages.filter((m) => m.role === 'user');
     if (userMessages.length < 1) return;
 
-    const previousConversations = await Conversation.find({
-      _id: {
-        $in: lead.conversations.filter((id) => id.toString() !== conversation._id.toString()),
-      },
-      status: 'ended',
-    }).sort({ startedAt: 1 });
+    const previousConversations = await claudeService.fetchAllPriorConversationsForLead(lead._id, {
+      excludeConversationId: conversation._id,
+    });
 
     const scoreData = await claudeService.scoreLead(
       session.messages,
@@ -166,9 +185,10 @@ router.post('/incoming', async (req, res) => {
     session.callerPhone = callerPhone;
 
     // Check if this phone number belongs to a returning lead
-    let lead = await Lead.findOne({ phone: callerPhone });
+    let lead = await findLeadByCallerPhone(callerPhone);
     let isReturning = false;
     let greeting = '';
+    let previousConversations = [];
 
     if (lead) {
       isReturning = true;
@@ -178,19 +198,17 @@ router.post('/incoming', async (req, res) => {
 
       session.leadId = lead._id.toString();
 
-      // Full saved history (chat + voice), same breadth as web chat — feeds model message thread each turn
-      const previousConversations = await Conversation.find({
-        leadId: lead._id,
-        status: 'ended',
-      }).sort({ startedAt: 1 });
+      // Full saved history (chat + voice), including still-open web sessions — same as what the user actually discussed
+      previousConversations = await claudeService.fetchAllPriorConversationsForLead(lead._id, {});
       session.previousConversations = previousConversations;
 
-      // Returning caller greeting with previous-conversation summary (same style as chat).
+      // Returning caller greeting: phone-appropriate, uses full prior thread context (not "ended only").
       try {
         greeting = await claudeService.getGreeting(
           true,
           lead.name,
-          previousConversations
+          previousConversations,
+          { channel: 'voice' }
         );
       } catch (greetErr) {
         console.error('[Voice] Returning greeting generation error:', greetErr.message);
@@ -225,6 +243,10 @@ router.post('/incoming', async (req, res) => {
       startedAt: session.startedAt,
     });
     await conversation.save();
+    // Never inject this call's (still-empty) thread as "prior" context if lists are ever reloaded
+    session.previousConversations = previousConversations.filter(
+      (c) => c._id.toString() !== conversation._id.toString()
+    );
     lead.conversations.push(conversation._id);
     lead.totalConversations = lead.conversations.length;
     lead.lastSeen = new Date();
@@ -280,7 +302,7 @@ router.post('/respond', async (req, res) => {
     <Say voice="${VOICE}">Sorry, I didn't quite catch that. Could you repeat that for me?</Say>
   </Gather>
   <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="4" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
-    <Say voice="${VOICE}">I'm still here if you'd like to chat.</Say>
+    <Say voice="${VOICE}">Take your time — I'm listening.</Say>
   </Gather>
   <Hangup/>
 </Response>`;
@@ -319,7 +341,7 @@ router.post('/listen', (req, res) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
-    <Say voice="${VOICE}">I'm still here whenever you're ready.</Say>
+    <Say voice="${VOICE}">Still with you — say something when you're ready.</Say>
   </Gather>
   <Say voice="${VOICE}">It seems like we got disconnected. Feel free to call back anytime. Bye!</Say>
   <Hangup/>
@@ -430,12 +452,9 @@ router.post('/status', async (req, res) => {
     const userMessages = session.messages.filter((m) => m.role === 'user');
     if (userMessages.length >= 1) {
       try {
-        const previousConversations = await Conversation.find({
-          _id: {
-            $in: lead.conversations.filter((id) => id.toString() !== newConv._id.toString()),
-          },
-          status: 'ended',
-        }).sort({ startedAt: 1 });
+        const previousConversations = await claudeService.fetchAllPriorConversationsForLead(lead._id, {
+          excludeConversationId: newConv._id,
+        });
 
         const scoreData = await claudeService.scoreLead(
           session.messages,
