@@ -42,6 +42,9 @@ const ConversationSchema = new mongoose.Schema({
   leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', required: true },
   messages: [MessageSchema],
   quote: QuoteSchema,
+  /** Rolling dense summary for model context; full messages remain source of truth. */
+  contextSummary: { type: String, default: '' },
+  contextSummaryUpdatedAt: Date,
   status: { type: String, enum: ['active', 'ended'], default: 'active' },
   startedAt: { type: Date, default: Date.now },
   endedAt: Date,

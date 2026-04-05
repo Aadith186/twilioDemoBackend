@@ -13,8 +13,10 @@ const voiceClaude = require('../services/voice-claude');
 const VOICE = process.env.TWILIO_VOICE || 'Polly.Matthew';
 const SPEECH_LANGUAGE = process.env.TWILIO_SPEECH_LANG || 'en-IN';
 // NOTE: experimental_conversations model requires an integer — 'auto' is NOT supported with it.
-// Set TWILIO_SPEECH_TIMEOUT in your .env to override (e.g. 1 or 2). Default is 1 second.
-const SPEECH_TIMEOUT = process.env.TWILIO_SPEECH_TIMEOUT || '1';
+// Set TWILIO_SPEECH_TIMEOUT in your .env to override. Default 3s gives callers time to think after Alex speaks.
+const SPEECH_TIMEOUT = process.env.TWILIO_SPEECH_TIMEOUT || '3';
+// Second Gather: longer silent listen so we do not immediately play a “still there?” line.
+const SPEECH_TIMEOUT_EXTENDED = process.env.TWILIO_SPEECH_TIMEOUT_EXTENDED || '8';
 
 // Helper: build the base URL from the request
 function getBaseUrl(req) {
@@ -31,7 +33,7 @@ function getBaseUrl(req) {
 // bargeIn="true" = stops TTS immediately when caller starts speaking
 // speechModel="experimental_conversations" = best for conversational AI
 // speechTimeout must be an integer — "auto" is NOT supported with experimental_conversations
-function buildTwiML(res, sayText, req, isSSML = true) {
+function buildTwiML(res, sayText, req, isSSML = true, callSid = null) {
   const baseUrl = getBaseUrl(req);
   const voiceAttr = `voice="${VOICE}"`;
 
@@ -42,13 +44,26 @@ function buildTwiML(res, sayText, req, isSSML = true) {
     sayContent = escapeXml(sayText);
   }
 
+  let secondGatherInner;
+  if (callSid) {
+    const session = voiceClaude.getCallSession(callSid);
+    const n = session.silencePromptCount || 0;
+    if (n === 0) {
+      secondGatherInner = `<Pause length="1"/>`;
+    } else {
+      secondGatherInner = `<Say ${voiceAttr}>Still there? Just say something when you're ready.</Say>`;
+    }
+  } else {
+    secondGatherInner = `<Pause length="1"/>`;
+  }
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
     <Say ${voiceAttr}>${sayContent}</Say>
   </Gather>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="4" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
-    <Say ${voiceAttr}>No rush — I'm here. Whenever you're ready.</Say>
+  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT_EXTENDED}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
+    ${secondGatherInner}
   </Gather>
   <Say ${voiceAttr}>It seems like we lost each other. Feel free to call back anytime!</Say>
   <Hangup/>
@@ -114,6 +129,15 @@ async function persistVoiceTurn(req, callSid) {
     conversation.messages = mapSessionMessagesToSchema(session);
     if (session.quote) conversation.quote = session.quote;
     await conversation.save();
+
+    void claudeService
+      .refreshContextSummaryAfterTurn(conversation._id)
+      .then(() => Conversation.findById(conversation._id).select('contextSummary').lean())
+      .then((doc) => {
+        const sess = voiceClaude.getCallSession(callSid);
+        if (doc && sess) sess.rollingSummary = String(doc.contextSummary || '').trim();
+      })
+      .catch((e) => console.error('[Voice] contextSummary refresh:', e.message || e));
 
     let lead =
       (session.leadId && (await Lead.findById(session.leadId))) ||
@@ -276,12 +300,12 @@ router.post('/incoming', async (req, res) => {
     }
 
     // Return TwiML: say greeting, then listen
-    buildTwiML(res, greeting, req);
+    buildTwiML(res, greeting, req, true, callSid);
 
   } catch (err) {
     console.error('[Voice] Incoming call error:', err);
     const fallback = `Hey, thanks for calling Steel Building Depot. I'm Alex. What can I help you with today?`;
-    buildTwiML(res, fallback, req, false);
+    buildTwiML(res, fallback, req, false, callSid);
   }
 });
 
@@ -295,14 +319,16 @@ router.post('/respond', async (req, res) => {
   console.log(`[Voice] Speech from ${callSid}: "${speechResult}" (confidence: ${confidence})`);
 
   if (!speechResult || speechResult.trim() === '') {
+    const session = voiceClaude.getCallSession(callSid);
+    session.silencePromptCount = (session.silencePromptCount || 0) + 1;
     const baseUrl = getBaseUrl(req);
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
-    <Say voice="${VOICE}">Sorry, I didn't quite catch that. Could you repeat that for me?</Say>
+    <Say voice="${VOICE}">Sorry, I didn't quite catch that — could you say that again?</Say>
   </Gather>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="4" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
-    <Say voice="${VOICE}">Take your time — I'm listening.</Say>
+  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT_EXTENDED}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
+    <Pause length="1"/>
   </Gather>
   <Hangup/>
 </Response>`;
@@ -311,6 +337,9 @@ router.post('/respond', async (req, res) => {
   }
 
   try {
+    const session = voiceClaude.getCallSession(callSid);
+    session.silencePromptCount = 0;
+
     // Get Claude's response
     const { text, quoteData } = await voiceClaude.voiceChat(callSid, speechResult.trim());
 
@@ -322,7 +351,7 @@ router.post('/respond', async (req, res) => {
     }
 
     // Return TwiML with Claude's response first — DB sync runs in background
-    buildTwiML(res, text, req);
+    buildTwiML(res, text, req, true, callSid);
     void persistVoiceTurn(req, callSid).catch((e) =>
       console.error('[Voice] persistVoiceTurn failed:', e.message || e)
     );
@@ -330,7 +359,7 @@ router.post('/respond', async (req, res) => {
   } catch (err) {
     console.error('[Voice] Respond error:', err);
     const fallback = `Sorry about that, I had a little hiccup on my end. Could you repeat what you just said?`;
-    buildTwiML(res, fallback, req, false);
+    buildTwiML(res, fallback, req, false, callSid);
   }
 });
 
@@ -341,7 +370,7 @@ router.post('/listen', (req, res) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
-    <Say voice="${VOICE}">Still with you — say something when you're ready.</Say>
+    <Say voice="${VOICE}">Whenever you're ready, go ahead.</Say>
   </Gather>
   <Say voice="${VOICE}">It seems like we got disconnected. Feel free to call back anytime. Bye!</Say>
   <Hangup/>

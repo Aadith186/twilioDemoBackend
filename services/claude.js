@@ -3,6 +3,141 @@ const { PROJECT_LIFECYCLE_STAGES, Conversation } = require('../models');
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ─── CONTEXT SIZE (token / rate-limit pressure) ─────────────────────────────
+// Rough guide: ~4 chars ≈ 1 token for English. Prior = stitched older sessions; live = current thread.
+// Set any limit to 0 or negative to disable trimming for that bucket (full history — may hit limits).
+function parseCharLimit(raw, fallback) {
+  const n = parseInt(String(raw != null && raw !== '' ? raw : fallback), 10);
+  return Number.isNaN(n) ? fallback : n;
+}
+
+function resolveContextLimits(options = {}) {
+  const defPrior = parseCharLimit(process.env.CLAUDE_MAX_PRIOR_CONTEXT_CHARS, 45000);
+  const defLive = parseCharLimit(process.env.CLAUDE_MAX_LIVE_CONTEXT_CHARS, 28000);
+  return {
+    maxPriorChars: options.maxPriorChars !== undefined ? options.maxPriorChars : defPrior,
+    maxLiveChars: options.maxLiveChars !== undefined ? options.maxLiveChars : defLive,
+  };
+}
+
+function resolveSummaryMaxChars() {
+  return parseCharLimit(process.env.CLAUDE_CONTEXT_SUMMARY_MAX_CHARS, 2200);
+}
+
+function resolveLiveVerbatimMessageCount(options = {}) {
+  if (options.useLiveHybrid === false) return 0;
+  if (options.liveVerbatimMessageCount != null) {
+    const n = parseInt(String(options.liveVerbatimMessageCount), 10);
+    return Number.isNaN(n) ? 12 : n;
+  }
+  return parseCharLimit(process.env.CLAUDE_LIVE_VERBATIM_TURNS, 12);
+}
+
+function capSummaryText(text, maxChars) {
+  const s = String(text || '').trim();
+  if (!s || maxChars <= 0) return s;
+  if (s.length <= maxChars) return s;
+  return `${s.slice(0, maxChars - 20)}\n…(trimmed)…`;
+}
+
+/**
+ * Merge the latest user+assistant exchange into a dense rolling summary for model context.
+ * On any failure returns previousSummary unchanged.
+ */
+async function mergeConversationContextSummary({
+  previousSummary = '',
+  newUserContent = '',
+  newAssistantContent = '',
+  channel = 'chat',
+}) {
+  const maxOut = resolveSummaryMaxChars();
+  const prev = String(previousSummary || '').trim();
+  const u = String(newUserContent || '').trim();
+  const a = String(newAssistantContent || '').trim();
+  if (!u && !a) return prev;
+
+  const channelNote =
+    channel === 'voice'
+      ? 'This exchange was on a phone call — keep spoken tone out of the summary; store facts only.'
+      : 'Web chat exchange.';
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 768,
+      system: `You maintain a compact MEMORY SUMMARY for a steel-building sales CRM. Output plain text only — short labeled lines or bullets. No markdown headings. Preserve EVERY concrete fact from the previous summary (names, numbers, sqft, locations, quotes, materials, timeline). Merge in the new exchange; do not drop prior facts unless the customer explicitly corrected them (then update). ${channelNote} Max length: about ${Math.floor(maxOut / 5)} words. Be dense.`,
+      messages: [
+        {
+          role: 'user',
+          content: `PREVIOUS SUMMARY (keep all facts unless corrected):\n${prev || '(none)'}\n\nNEW — Customer:\n${u}\n\nNEW — Alex:\n${a}\n\nReply with the updated summary only.`,
+        },
+      ],
+    });
+    const out = (response.content[0] && response.content[0].text) ? String(response.content[0].text).trim() : '';
+    if (!out) return prev;
+    return capSummaryText(out, maxOut);
+  } catch (e) {
+    console.error('[Claude] mergeConversationContextSummary:', e.message || e);
+    return prev;
+  }
+}
+
+/**
+ * Reload conversation from DB and extend contextSummary from the last user+assistant pair.
+ * Safe to fire-and-forget.
+ */
+async function refreshContextSummaryAfterTurn(conversationId) {
+  if (!conversationId) return;
+  try {
+    const conv = await Conversation.findById(conversationId).lean();
+    if (!conv || !conv.messages || conv.messages.length < 2) return;
+    const msgs = conv.messages;
+    const last = msgs[msgs.length - 1];
+    const prev = msgs[msgs.length - 2];
+    if (last.role !== 'assistant' || prev.role !== 'user') return;
+    const merged = await mergeConversationContextSummary({
+      previousSummary: conv.contextSummary || '',
+      newUserContent: String(prev.content || ''),
+      newAssistantContent: String(last.content || ''),
+      channel: conv.channel === 'voice' ? 'voice' : 'chat',
+    });
+    await Conversation.findByIdAndUpdate(conversationId, {
+      contextSummary: merged,
+      contextSummaryUpdatedAt: new Date(),
+    });
+  } catch (e) {
+    console.error('[Claude] refreshContextSummaryAfterTurn:', e.message || e);
+  }
+}
+
+/** Keep the newest messages whose total content fits in maxChars; drop oldest first. */
+function keepRecentMessagesWithinBudget(messages, maxChars) {
+  if (!messages || messages.length === 0) return [];
+  if (maxChars <= 0) return messages;
+
+  const kept = [];
+  let total = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const c = String(m.content || '');
+    if (c.length > maxChars && kept.length === 0) {
+      return [{ role: m.role, content: `…(truncated)…\n${c.slice(-(maxChars - 16))}` }];
+    }
+    if (total + c.length > maxChars) break;
+    kept.push({ role: m.role, content: c });
+    total += c.length;
+  }
+  kept.reverse();
+  if (kept.length > 0 && kept.length < messages.length) {
+    const first = kept[0];
+    kept[0] = {
+      role: first.role,
+      content: '[Older messages omitted — most recent history follows.]\n\n' + first.content,
+    };
+  }
+  return kept;
+}
+
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 const SALES_SYSTEM_PROMPT = `You are Alex, a sales executive at Steel Building Depot. You help customers get ballpark estimates for construction and installation projects.
 
@@ -87,7 +222,7 @@ IMPORTANT RULES:
 - Read the last few messages you sent: do not echo the same opening or sign-off pattern — vary like a human would across a real back-and-forth`;
 
 // ─── RETURNING USER MEMORY PROMPT ────────────────────────────────────────────
-function buildMemoryContext(previousConversations) {
+function buildMemoryContext(previousConversations, meta = {}) {
   if (!previousConversations || previousConversations.length === 0) return '';
 
   const quoteHints = previousConversations
@@ -97,10 +232,18 @@ function buildMemoryContext(previousConversations) {
     })
     .filter(Boolean);
 
+  const usedSummaries = meta.usedPriorSummaries === true;
+
   let memory = '\n\n--- RETURNING CUSTOMER ---\n';
-  memory += `This lead has ${previousConversations.length} earlier conversation(s) in the message thread below (oldest first), each labeled — full user + Alex transcript. Use all of it for continuity.\n`;
+  memory += usedSummaries
+    ? `This lead has ${previousConversations.length} earlier session(s) below as compact summaries (oldest first), plus the newest session in full recent turns.\n`
+    : `This lead has ${previousConversations.length} earlier conversation(s) in the message thread below (oldest first), each labeled — user + Alex lines (may be trimmed for length).\n`;
   if (quoteHints.length) memory += `Saved quotes from prior sessions: ${quoteHints.join('; ')}.\n`;
-  memory += 'Reference prior projects and numbers naturally; do not re-ask for details already in that thread.\n';
+  if (meta.priorTrimmed || meta.liveTrimmed) {
+    memory +=
+      'Some content may be omitted for size — use summaries and quote hints; if something material is missing, ask one short clarifying question.\n';
+  }
+  memory += 'Reference prior projects and numbers naturally; do not re-ask for details clearly already captured.\n';
   return memory;
 }
 
@@ -118,6 +261,13 @@ async function fetchAllPriorConversationsForLead(leadId, { excludeConversationId
   const filter = { leadId };
   if (excludeId != null) filter._id = { $ne: excludeId };
   return Conversation.find(filter).sort({ startedAt: 1 }).lean();
+}
+
+/** Active thread summary for hybrid live context (voice CallSid or web sessionId). */
+async function getContextSummaryForSession(sessionId) {
+  if (sessionId == null || String(sessionId).trim() === '') return '';
+  const c = await Conversation.findOne({ sessionId: String(sessionId) }).select('contextSummary').lean();
+  return c && c.contextSummary ? String(c.contextSummary).trim() : '';
 }
 
 /**
@@ -149,11 +299,30 @@ function ensureAnthropicMessageAlternation(messages) {
 
 function buildFullConversationMessages(currentMessages, previousConversations = [], options = {}) {
   const labelPriorSessions = options.labelPriorSessions === true;
+  const usePriorSummaries = options.usePriorSummaries !== false;
+  const currentConversationSummary = String(options.currentConversationSummary || '').trim();
+  const verbatimCount = resolveLiveVerbatimMessageCount(options);
+  const { maxPriorChars, maxLiveChars } = resolveContextLimits(options);
+
   const sorted = [...(previousConversations || [])].sort(
     (a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime()
   );
 
+  let usedPriorSummaries = false;
   const historicalMessages = sorted.flatMap((conv) => {
+    const summary = (conv.contextSummary || '').trim();
+    if (usePriorSummaries && summary) {
+      usedPriorSummaries = true;
+      const ch = conv.channel === 'voice' ? 'phone call' : 'web chat';
+      const when = conv.startedAt
+        ? new Date(conv.startedAt).toISOString().slice(0, 19).replace('T', ' ')
+        : 'unknown date';
+      const label = labelPriorSessions
+        ? `--- Prior ${ch} (${when}) — condensed summary ---\n${summary}`
+        : `Prior ${ch} (${when}): ${summary}`;
+      return [{ role: 'user', content: label }];
+    }
+
     const rows = (conv.messages || [])
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
       .map((m, idx) => {
@@ -170,20 +339,69 @@ function buildFullConversationMessages(currentMessages, previousConversations = 
     return rows;
   });
 
-  const liveMessages = (currentMessages || [])
+  let liveMessages = (currentMessages || [])
     .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
-    .map((m) => ({ role: m.role, content: m.content }));
+    .map((m) => ({ role: m.role, content: String(m.content) }));
 
-  return ensureAnthropicMessageAlternation([...historicalMessages, ...liveMessages]);
+  const fullLiveLen = liveMessages.length;
+  let liveSummaryPrefix = [];
+  if (verbatimCount > 0 && liveMessages.length > verbatimCount) {
+    if (currentConversationSummary) {
+      liveSummaryPrefix = [
+        {
+          role: 'user',
+          content: `[THIS SESSION — earlier turns (summary)]\n${currentConversationSummary}`,
+        },
+      ];
+      liveMessages = liveMessages.slice(-verbatimCount);
+    } else {
+      liveMessages = liveMessages.slice(-verbatimCount);
+    }
+  }
+
+  const combinedLive = [...liveSummaryPrefix, ...liveMessages];
+
+  let trimmedHistorical =
+    maxPriorChars <= 0 ? historicalMessages : keepRecentMessagesWithinBudget(historicalMessages, maxPriorChars);
+  let priorTrimmed = maxPriorChars > 0 && trimmedHistorical.length < historicalMessages.length;
+
+  if (maxPriorChars > 0 && historicalMessages.length > 0 && trimmedHistorical.length === 0) {
+    trimmedHistorical = [
+      {
+        role: 'user',
+        content:
+          '[Earlier sessions exist but were omitted for context size — use quote hints in system if any; ask the customer to recap key details if needed.]',
+      },
+    ];
+    priorTrimmed = true;
+  }
+
+  const trimmedLive =
+    maxLiveChars <= 0 ? combinedLive : keepRecentMessagesWithinBudget(combinedLive, maxLiveChars);
+  const liveTrimmed =
+    maxLiveChars > 0 &&
+    (trimmedLive.length < combinedLive.length ||
+      (verbatimCount > 0 && fullLiveLen > verbatimCount));
+
+  const messages = ensureAnthropicMessageAlternation([...trimmedHistorical, ...trimmedLive]);
+
+  return { messages, priorTrimmed, liveTrimmed, usedPriorSummaries };
 }
 
 // ─── MAIN CHAT FUNCTION ───────────────────────────────────────────────────────
-async function chat(messages, previousConversations = []) {
-  const memoryContext = buildMemoryContext(previousConversations);
-  const systemWithMemory = SALES_SYSTEM_PROMPT + memoryContext;
-  const fullContextMessages = buildFullConversationMessages(messages, previousConversations, {
+async function chat(messages, previousConversations = [], options = {}) {
+  const currentConversationSummary = options.currentConversationSummary ?? '';
+  const built = buildFullConversationMessages(messages, previousConversations, {
     labelPriorSessions: true,
+    currentConversationSummary,
   });
+  const memoryContext = buildMemoryContext(previousConversations, {
+    priorTrimmed: built.priorTrimmed,
+    liveTrimmed: built.liveTrimmed,
+    usedPriorSummaries: built.usedPriorSummaries,
+  });
+  const systemWithMemory = SALES_SYSTEM_PROMPT + memoryContext;
+  const fullContextMessages = built.messages;
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
@@ -262,9 +480,17 @@ function applyScoreDataToLead(lead, scoreData) {
 
 // ─── LEAD SCORING FUNCTION ────────────────────────────────────────────────────
 async function scoreLead(conversationMessages, leadName, previousConversations = []) {
-  const fullConversationMessages = buildFullConversationMessages(
+  const scorePriorCap = parseCharLimit(process.env.CLAUDE_MAX_SCORE_PRIOR_CHARS, 22000);
+  const scoreLiveCap = parseCharLimit(process.env.CLAUDE_MAX_SCORE_LIVE_CHARS, 18000);
+  const { messages: fullConversationMessages } = buildFullConversationMessages(
     conversationMessages,
-    previousConversations
+    previousConversations,
+    {
+      labelPriorSessions: false,
+      maxPriorChars: scorePriorCap,
+      maxLiveChars: scoreLiveCap,
+      useLiveHybrid: false,
+    }
   );
 
   const transcript = fullConversationMessages
@@ -344,6 +570,13 @@ async function getGreeting(isReturning, leadName, previousConversations = [], op
     if (previousConversations && previousConversations.length > 0) {
       const cap = forVoice ? 1200 : 400;
       const summary = previousConversations.map((c, i) => {
+        const stored = (c.contextSummary || '').trim();
+        if (stored) {
+          const quote = c.quote?.priceMin
+            ? ` (Quote: $${c.quote.priceMin.toLocaleString()}-$${c.quote.priceMax.toLocaleString()})`
+            : '';
+          return `Session ${i + 1}: ${stored.substring(0, cap)}${quote}`;
+        }
         const lines = (c.messages || [])
           .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
           .map((m) => `${m.role === 'user' ? 'Customer' : 'Alex'}: ${m.content}`);
@@ -378,7 +611,11 @@ module.exports = {
   scoreLead,
   getGreeting,
   buildFullConversationMessages,
+  resolveContextLimits,
   fetchAllPriorConversationsForLead,
+  getContextSummaryForSession,
   applyScoreDataToLead,
+  mergeConversationContextSummary,
+  refreshContextSummaryAfterTurn,
   PROJECT_LIFECYCLE_STAGES,
 };

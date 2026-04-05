@@ -226,7 +226,8 @@ module.exports = function setupSockets(io) {
         // Get AI response
         const { text, quoteData } = await claudeService.chat(
           conversation.messages,
-          previousConversations
+          previousConversations,
+          { currentConversationSummary: conversation.contextSummary || '' }
         );
 
         // Save AI response
@@ -238,6 +239,10 @@ module.exports = function setupSockets(io) {
         }
 
         await conversation.save();
+
+        void claudeService.refreshContextSummaryAfterTurn(conversation._id).catch((e) =>
+          console.error('[Socket] contextSummary refresh:', e.message || e)
+        );
 
         // Stop typing indicator
         socket.emit('ai_typing', false);

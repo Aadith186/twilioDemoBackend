@@ -1,5 +1,9 @@
 const Anthropic = require('@anthropic-ai/sdk');
-const { buildFullConversationMessages, fetchAllPriorConversationsForLead } = require('./claude');
+const {
+  buildFullConversationMessages,
+  fetchAllPriorConversationsForLead,
+  getContextSummaryForSession,
+} = require('./claude');
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─── VOICE SYSTEM PROMPT ──────────────────────────────────────────────────────
@@ -81,9 +85,14 @@ India:
 MEMORY INSTRUCTIONS:
 When prior sessions appear in the thread, treat them as real memory — use names, places, sqft, and quotes they actually mentioned. Sound like you remember: "Oh right, the Austin warehouse — we had you around forty to sixty K last time, yeah?" Never ask from scratch for details already in that history unless you need to confirm. Do not say you're "pulling up a file" or "according to our system" — just talk like you recall the conversation.
 
-END OF CALL:
+PHRASES TO AVOID (sounds like a chatbot / hold music):
+- "I'm here" / "I'm still here" / "I'm here whenever you're ready" / "No rush" as filler while they are thinking or between questions — never use these mid-call to fill silence.
+- Same for "Take your time, I'm listening" style reassurance — just ask your one question and wait; your next line should respond to what they said.
+- Use the lines below only when you are clearly wrapping up or they are ending the call — not during normal back-and-forth.
+
+END OF CALL (only when wrapping up or they are done — not mid-qualification):
 - If they seem ready to move forward: "Want me to have one of our senior estimators give you a call? They can do a proper site visit and get you a detailed quote."
-- If they need to think: "No rush at all. You've got my number, call back anytime. I'll remember our conversation."
+- If they need to think and are leaving: "No rush — you've got my number, call back anytime. I'll remember our conversation."
 - Always end warm: "Thanks for calling, really appreciate it."
 
 HANDLING INTERRUPTIONS:
@@ -118,6 +127,8 @@ function getCallSession(callSid) {
       startedAt: new Date(),
       quote: null,
       previousConversations: [],
+      rollingSummary: '',
+      silencePromptCount: 0,
     });
   }
   return activeCalls.get(callSid);
@@ -131,17 +142,25 @@ function deleteCallSession(callSid) {
 
 // Prior chat + voice transcripts are injected into the API `messages` via buildFullConversationMessages
 // (full multi-turn history, same pattern as web chat). System prompt only gets a short pointer so we do not duplicate.
-function buildVoiceHistoryInstruction(previousConversations) {
+function buildVoiceHistoryInstruction(previousConversations, meta = {}) {
   if (!previousConversations || previousConversations.length === 0) return '';
 
   const voiceCount = previousConversations.filter((c) => c.channel === 'voice').length;
   const chatCount = previousConversations.length - voiceCount;
 
-  return `\n\n--- PRIOR SAVED TRANSCRIPTS (in your message thread) ---\n` +
-    `The conversation messages below begin with ${previousConversations.length} complete earlier session(s) ` +
-    `(${chatCount} non-voice / ${voiceCount} voice), oldest sessions first — full customer + Alex transcript from our database. ` +
-    `After that block, the rest is THIS phone call. Use that history for continuity; still follow phone rules (short replies, one question).\n` +
-    `---\n`;
+  const priorDesc = meta.usedPriorSummaries
+    ? `(${chatCount} non-voice / ${voiceCount} voice), oldest first — each prior session is a compact summary where available, else transcript excerpts. `
+    : `(${chatCount} non-voice / ${voiceCount} voice), oldest sessions first — customer + Alex lines (oldest parts may be trimmed for token limits). `;
+
+  let block =
+    `\n\n--- PRIOR SAVED CONTEXT (in your message thread) ---\n` +
+    `The messages below begin with ${previousConversations.length} earlier session(s) ${priorDesc}` +
+    `After that block, the rest is THIS phone call. Use that history for continuity; still follow phone rules (short replies, one question).\n`;
+  if (meta.priorTrimmed || meta.liveTrimmed) {
+    block += `NOTE: Oldest lines may be omitted — use summaries and newest turns; ask one short recap if something material is missing.\n`;
+  }
+  block += `---\n`;
+  return block;
 }
 
 // ─── VOICE CHAT FUNCTION ──────────────────────────────────────────────────────
@@ -174,11 +193,26 @@ async function voiceChat(callSid, userSpeech) {
     session.messages.push({ role: 'user', content: userSpeech });
   }
 
-  const historyInstruction = buildVoiceHistoryInstruction(session.previousConversations);
-  const systemPrompt = VOICE_SYSTEM_PROMPT + historyInstruction;
-  const apiMessages = buildFullConversationMessages(session.messages, session.previousConversations, {
+  let fromDb = '';
+  try {
+    fromDb = await getContextSummaryForSession(callSid);
+  } catch (_) {
+    /* use session only */
+  }
+  const currentConversationSummary =
+    (session.rollingSummary && String(session.rollingSummary).trim()) || fromDb;
+
+  const built = buildFullConversationMessages(session.messages, session.previousConversations, {
     labelPriorSessions: true,
+    currentConversationSummary,
   });
+  const historyInstruction = buildVoiceHistoryInstruction(session.previousConversations, {
+    priorTrimmed: built.priorTrimmed,
+    liveTrimmed: built.liveTrimmed,
+    usedPriorSummaries: built.usedPriorSummaries,
+  });
+  const systemPrompt = VOICE_SYSTEM_PROMPT + historyInstruction;
+  const apiMessages = built.messages;
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
