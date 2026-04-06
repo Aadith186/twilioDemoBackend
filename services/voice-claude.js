@@ -6,6 +6,10 @@ const {
 } = require('./claude');
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+const PRIOR_FETCH_TTL_MS = parseInt(process.env.VOICE_PRIOR_FETCH_TTL_MS || '120000', 10);
+const CONTEXT_SUMMARY_TTL_MS = parseInt(process.env.VOICE_CONTEXT_SUMMARY_TTL_MS || '30000', 10);
+const VOICE_MAX_TOKENS = parseInt(process.env.VOICE_CLAUDE_MAX_TOKENS || '240', 10);
+
 // ─── VOICE SYSTEM PROMPT ──────────────────────────────────────────────────────
 // Completely different from the chat prompt. This is a PHONE CALL.
 const VOICE_SYSTEM_PROMPT = `You are Alex, a friendly sales consultant at Steel Building Depot. You are on a LIVE PHONE CALL with a customer.
@@ -167,14 +171,19 @@ function buildVoiceHistoryInstruction(previousConversations, meta = {}) {
 async function voiceChat(callSid, userSpeech) {
   const session = getCallSession(callSid);
 
-  // Reload from DB every turn: all conversations for this lead + every message (excludes this call only)
+  // Prior sessions rarely change mid-call — refresh on TTL to cut DB latency per turn.
   if (session.leadId) {
-    try {
-      session.previousConversations = await fetchAllPriorConversationsForLead(session.leadId, {
-        excludeSessionId: callSid,
-      });
-    } catch (err) {
-      console.error('[Voice] fetchAllPriorConversationsForLead:', err.message || err);
+    const stale =
+      !session._priorFetchedAt || Date.now() - session._priorFetchedAt > PRIOR_FETCH_TTL_MS;
+    if (stale) {
+      try {
+        session.previousConversations = await fetchAllPriorConversationsForLead(session.leadId, {
+          excludeSessionId: callSid,
+        });
+        session._priorFetchedAt = Date.now();
+      } catch (err) {
+        console.error('[Voice] fetchAllPriorConversationsForLead:', err.message || err);
+      }
     }
   }
 
@@ -193,14 +202,25 @@ async function voiceChat(callSid, userSpeech) {
     session.messages.push({ role: 'user', content: userSpeech });
   }
 
+  const roll = session.rollingSummary && String(session.rollingSummary).trim();
   let fromDb = '';
-  try {
-    fromDb = await getContextSummaryForSession(callSid);
-  } catch (_) {
-    /* use session only */
+  if (!roll) {
+    const sumStale =
+      !session._dbSummaryFetchedAt ||
+      Date.now() - session._dbSummaryFetchedAt > CONTEXT_SUMMARY_TTL_MS;
+    if (sumStale) {
+      try {
+        fromDb = await getContextSummaryForSession(callSid);
+        session._cachedDbSummary = fromDb;
+        session._dbSummaryFetchedAt = Date.now();
+      } catch (_) {
+        /* use session only */
+      }
+    } else {
+      fromDb = session._cachedDbSummary || '';
+    }
   }
-  const currentConversationSummary =
-    (session.rollingSummary && String(session.rollingSummary).trim()) || fromDb;
+  const currentConversationSummary = roll || fromDb;
 
   const built = buildFullConversationMessages(session.messages, session.previousConversations, {
     labelPriorSessions: true,
@@ -216,7 +236,7 @@ async function voiceChat(callSid, userSpeech) {
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 280, // Enough for a natural 1–2 sentence reply without clipping
+    max_tokens: Number.isNaN(VOICE_MAX_TOKENS) ? 240 : VOICE_MAX_TOKENS,
     system: systemPrompt,
     messages: apiMessages
   });

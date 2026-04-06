@@ -14,20 +14,33 @@ const VOICE = process.env.TWILIO_VOICE || 'Polly.Matthew';
 const SPEECH_LANGUAGE = process.env.TWILIO_SPEECH_LANG || 'en-IN';
 
 /*
- * Transcription quality (Twilio <Gather>):
- * - TWILIO_SPEECH_MODEL: default experimental_conversations. Try phone_call for phone-tuned STT; pair with TWILIO_GATHER_ENHANCED=true (Twilio docs).
- * - TWILIO_SPEECH_LANG: en-US often recognizes US English better than en-IN if your callers are mostly US.
- * - TWILIO_SPEECH_HINTS: comma-separated terms, e.g. "steel building,warehouse,square feet,estimate"
- * - For studio-grade STT: Twilio Media Streams + Deepgram/AssemblyAI (not implemented here).
+ * Twilio <Gather> tuning (related env vars are declared below in this file):
+ * - TWILIO_GATHER_INPUT_TIMEOUT: seconds to wait for caller to START talking after Alex (default 55). Twilio’s own default `timeout` is 5s — that was ending calls too soon.
+ * - TWILIO_SPEECH_END_TIMEOUT: endpointing when using speechModel (default 2s after they pause — faster handoff to Claude).
+ * - TWILIO_SPEECH_ENDPOINT_MODE=auto: speechTimeout=auto and omit speechModel (Twilio default STT; good end-of-utterance detection; cannot use experimental_conversations).
+ * - TWILIO_SPEECH_MODEL / TWILIO_SPEECH_LANG / TWILIO_SPEECH_HINTS / TWILIO_GATHER_ENHANCED as before.
  */
 const SPEECH_MODEL = process.env.TWILIO_SPEECH_MODEL || 'experimental_conversations';
-// NOTE: speechModel requires integer speechTimeout — 'auto' is NOT supported with experimental_conversations.
-// Seconds to listen after Alex speaks before Twilio POSTs empty SpeechResult to /respond.
-const SPEECH_TIMEOUT = process.env.TWILIO_SPEECH_TIMEOUT || '8';
-// Each “dead air” retry: one Gather with this timeout (one POST per timeout, so one counter step).
-const SILENCE_RETRY_TIMEOUT = process.env.TWILIO_SILENCE_RETRY_TIMEOUT || '12';
-// Human-style nudges before hangup (default 3). The (max+1)th empty/low-confidence round ends the call.
-const MAX_SILENCE_PROMPTS = Math.max(1, parseInt(process.env.TWILIO_MAX_SILENCE_PROMPTS || '3', 10));
+/*
+ * Twilio Gather has TWO timeouts (easy to confuse):
+ * - timeout: max seconds to wait for the caller to START speaking after nested <Say> finishes. Default is 5 — that is why calls felt like they dropped after ~5s silence.
+ * - speechTimeout: seconds of silence AFTER the caller stops talking before Twilio finalizes the transcript (endpointing). Lower = faster webhook to /respond after they speak.
+ *
+ * speechTimeout="auto" only works WITHOUT speechModel (Twilio default STT). If you set speechModel, you must use a positive integer for speechTimeout.
+ */
+const GATHER_INPUT_TIMEOUT =
+  process.env.TWILIO_GATHER_INPUT_TIMEOUT || process.env.TWILIO_SPEECH_TIMEOUT || '55';
+// Endpointing when using an explicit speechModel (seconds after they pause mid-utterance)
+const SPEECH_END_TIMEOUT = process.env.TWILIO_SPEECH_END_TIMEOUT || '2';
+// auto = speechTimeout auto + omit speechModel (faster end-of-utterance; Twilio picks STT). fixed = use SPEECH_MODEL + SPEECH_END_TIMEOUT
+const SPEECH_ENDPOINT_MODE = (process.env.TWILIO_SPEECH_ENDPOINT_MODE || 'fixed').toLowerCase();
+// Each “dead air” retry: one Gather; same input timeout so user has time to answer after a nudge.
+const SILENCE_RETRY_INPUT_TIMEOUT =
+  process.env.TWILIO_SILENCE_RETRY_INPUT_TIMEOUT || GATHER_INPUT_TIMEOUT;
+const SILENCE_RETRY_SPEECH_END =
+  process.env.TWILIO_SILENCE_RETRY_SPEECH_END || SPEECH_END_TIMEOUT;
+// Human-style nudges before hangup. The (max+1)th empty/low-confidence round ends the call.
+const MAX_SILENCE_PROMPTS = Math.max(1, parseInt(process.env.TWILIO_MAX_SILENCE_PROMPTS || '5', 10));
 // If > 0 and Twilio Confidence is below this, treat as mis-heard (garbage STT) and retry like silence.
 const MIN_SPEECH_CONFIDENCE = parseFloat(process.env.TWILIO_MIN_SPEECH_CONFIDENCE || '0');
 
@@ -49,8 +62,23 @@ function getBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-function gatherSpeechAttrs(baseUrl, speechTimeout) {
-  let attrs = `input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${speechTimeout}" speechModel="${escapeXml(SPEECH_MODEL)}" language="${escapeXml(SPEECH_LANGUAGE)}" bargeIn="true"`;
+/**
+ * @param {'main'|'silence'} which - main after Alex speaks, or silence-retry gather
+ */
+function gatherSpeechAttrs(baseUrl, which = 'main') {
+  const inputTimeout =
+    which === 'silence' ? SILENCE_RETRY_INPUT_TIMEOUT : GATHER_INPUT_TIMEOUT;
+  const useAutoEndpoint = SPEECH_ENDPOINT_MODE === 'auto';
+
+  let attrs = `input="speech" action="${baseUrl}/api/voice/respond" method="POST" timeout="${inputTimeout}" language="${escapeXml(SPEECH_LANGUAGE)}" bargeIn="true"`;
+
+  if (useAutoEndpoint) {
+    attrs += ' speechTimeout="auto"';
+    return attrs;
+  }
+
+  const speechEnd = which === 'silence' ? SILENCE_RETRY_SPEECH_END : SPEECH_END_TIMEOUT;
+  attrs += ` speechTimeout="${speechEnd}" speechModel="${escapeXml(SPEECH_MODEL)}"`;
   if (SPEECH_MODEL === 'phone_call' && String(process.env.TWILIO_GATHER_ENHANCED).toLowerCase() === 'true') {
     attrs += ' enhanced="true"';
   }
@@ -97,7 +125,7 @@ function sendSilenceRetryOrHangup(res, req, callSid, opts = {}) {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather ${gatherSpeechAttrs(baseUrl, SILENCE_RETRY_TIMEOUT)}>
+  <Gather ${gatherSpeechAttrs(baseUrl, 'silence')}>
     ${inner}
   </Gather>
 </Response>`;
@@ -119,7 +147,7 @@ function buildTwiML(res, sayText, req, isSSML = true, _callSid = null) {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather ${gatherSpeechAttrs(baseUrl, SPEECH_TIMEOUT)}>
+  <Gather ${gatherSpeechAttrs(baseUrl, 'main')}>
     <Say ${voiceAttr}>${sayContent}</Say>
   </Gather>
 </Response>`;
@@ -408,7 +436,7 @@ router.post('/listen', (req, res) => {
   const voiceAttr = `voice="${VOICE}"`;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather ${gatherSpeechAttrs(baseUrl, SILENCE_RETRY_TIMEOUT)}>
+  <Gather ${gatherSpeechAttrs(baseUrl, 'silence')}>
     <Say ${voiceAttr}>Whenever you're ready, go ahead.</Say>
   </Gather>
 </Response>`;
