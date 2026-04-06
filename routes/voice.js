@@ -33,7 +33,10 @@ const GATHER_INPUT_TIMEOUT =
 // Endpointing when using an explicit speechModel (seconds after they pause mid-utterance)
 const SPEECH_END_TIMEOUT = process.env.TWILIO_SPEECH_END_TIMEOUT || '2';
 // auto = speechTimeout auto + omit speechModel (faster end-of-utterance; Twilio picks STT). fixed = use SPEECH_MODEL + SPEECH_END_TIMEOUT
-const SPEECH_ENDPOINT_MODE = (process.env.TWILIO_SPEECH_ENDPOINT_MODE || 'fixed').toLowerCase();
+// DEFAULT IS 'auto': experimental_conversations only supports en-US, not en-IN.
+// Using 'auto' tells Twilio to choose the STT engine, which correctly handles en-IN and all other languages.
+// Switch to 'fixed' + set TWILIO_SPEECH_MODEL=phone_call only if you need a specific model.
+const SPEECH_ENDPOINT_MODE = (process.env.TWILIO_SPEECH_ENDPOINT_MODE || 'auto').toLowerCase();
 // Each “dead air” retry: one Gather; same input timeout so user has time to answer after a nudge.
 const SILENCE_RETRY_INPUT_TIMEOUT =
   process.env.TWILIO_SILENCE_RETRY_INPUT_TIMEOUT || GATHER_INPUT_TIMEOUT;

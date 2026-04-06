@@ -187,20 +187,12 @@ async function voiceChat(callSid, userSpeech) {
     }
   }
 
-  // Detect possible interruption:
-  // If the last message was from assistant, the user might have cut it off
-  // (Twilio stops TTS when user speaks, then sends us what they said)
-  const lastMsg = session.messages[session.messages.length - 1];
-  const wasInterrupted = lastMsg && lastMsg.role === 'assistant';
-
-  // If likely interrupted, annotate so Claude knows
-  if (wasInterrupted) {
-    // Add a system-level hint as a user message prefix
-    const interruptNote = `[NOTE: The customer may have interrupted your previous response. They might not have heard all of what you said. Your last response was: "${lastMsg.content.substring(0, 120)}..." — Don't repeat yourself fully, but briefly acknowledge if needed and respond to what they're saying now.]`;
-    session.messages.push({ role: 'user', content: `${interruptNote}\n\nCustomer said: ${userSpeech}` });
-  } else {
-    session.messages.push({ role: 'user', content: userSpeech });
-  }
+  // Push user speech directly.
+  // wasInterrupted was removed — it triggered on EVERY turn (last message is always assistant),
+  // injecting a false interrupt note into every user message and corrupting Claude's context.
+  // Twilio sends barge-in and normal responses identically to /respond, so server-side detection
+  // is not possible. The system prompt already handles interruptions naturally.
+  session.messages.push({ role: 'user', content: userSpeech });
 
   const roll = session.rollingSummary && String(session.rollingSummary).trim();
   let fromDb = '';
