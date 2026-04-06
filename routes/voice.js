@@ -12,28 +12,101 @@ const voiceClaude = require('../services/voice-claude');
 // Google.en-IN-Neural2-A = Indian English Female
 const VOICE = process.env.TWILIO_VOICE || 'Polly.Matthew';
 const SPEECH_LANGUAGE = process.env.TWILIO_SPEECH_LANG || 'en-IN';
-// NOTE: experimental_conversations model requires an integer — 'auto' is NOT supported with it.
-// Set TWILIO_SPEECH_TIMEOUT in your .env to override. Default 3s gives callers time to think after Alex speaks.
-const SPEECH_TIMEOUT = process.env.TWILIO_SPEECH_TIMEOUT || '3';
-// Second Gather: longer silent listen so we do not immediately play a “still there?” line.
-const SPEECH_TIMEOUT_EXTENDED = process.env.TWILIO_SPEECH_TIMEOUT_EXTENDED || '8';
+
+/*
+ * Transcription quality (Twilio <Gather>):
+ * - TWILIO_SPEECH_MODEL: default experimental_conversations. Try phone_call for phone-tuned STT; pair with TWILIO_GATHER_ENHANCED=true (Twilio docs).
+ * - TWILIO_SPEECH_LANG: en-US often recognizes US English better than en-IN if your callers are mostly US.
+ * - TWILIO_SPEECH_HINTS: comma-separated terms, e.g. "steel building,warehouse,square feet,estimate"
+ * - For studio-grade STT: Twilio Media Streams + Deepgram/AssemblyAI (not implemented here).
+ */
+const SPEECH_MODEL = process.env.TWILIO_SPEECH_MODEL || 'experimental_conversations';
+// NOTE: speechModel requires integer speechTimeout — 'auto' is NOT supported with experimental_conversations.
+// Seconds to listen after Alex speaks before Twilio POSTs empty SpeechResult to /respond.
+const SPEECH_TIMEOUT = process.env.TWILIO_SPEECH_TIMEOUT || '8';
+// Each “dead air” retry: one Gather with this timeout (one POST per timeout, so one counter step).
+const SILENCE_RETRY_TIMEOUT = process.env.TWILIO_SILENCE_RETRY_TIMEOUT || '12';
+// Human-style nudges before hangup (default 3). The (max+1)th empty/low-confidence round ends the call.
+const MAX_SILENCE_PROMPTS = Math.max(1, parseInt(process.env.TWILIO_MAX_SILENCE_PROMPTS || '3', 10));
+// If > 0 and Twilio Confidence is below this, treat as mis-heard (garbage STT) and retry like silence.
+const MIN_SPEECH_CONFIDENCE = parseFloat(process.env.TWILIO_MIN_SPEECH_CONFIDENCE || '0');
+
+function escapeXml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
 
 // Helper: build the base URL from the request
 function getBaseUrl(req) {
-  // Use env var if set (for ngrok etc.), otherwise build from request
   if (process.env.SERVER_PUBLIC_URL) {
-    return process.env.SERVER_PUBLIC_URL.replace(/\/$/, ''); // strip trailing slash
+    return process.env.SERVER_PUBLIC_URL.replace(/\/$/, '');
   }
   const proto = req.headers['x-forwarded-proto'] || req.protocol;
   const host = req.headers['x-forwarded-host'] || req.get('host');
   return `${proto}://${host}`;
 }
 
-// Helper: wrap text in TwiML Say + Gather loop
-// bargeIn="true" = stops TTS immediately when caller starts speaking
-// speechModel="experimental_conversations" = best for conversational AI
-// speechTimeout must be an integer — "auto" is NOT supported with experimental_conversations
-function buildTwiML(res, sayText, req, isSSML = true, callSid = null) {
+function gatherSpeechAttrs(baseUrl, speechTimeout) {
+  let attrs = `input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${speechTimeout}" speechModel="${escapeXml(SPEECH_MODEL)}" language="${escapeXml(SPEECH_LANGUAGE)}" bargeIn="true"`;
+  if (SPEECH_MODEL === 'phone_call' && String(process.env.TWILIO_GATHER_ENHANCED).toLowerCase() === 'true') {
+    attrs += ' enhanced="true"';
+  }
+  const hintsRaw = process.env.TWILIO_SPEECH_HINTS;
+  if (hintsRaw && String(hintsRaw).trim()) {
+    const hintsNormalized = String(hintsRaw).replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+    attrs += ` hints="${escapeXml(hintsNormalized)}"`;
+  }
+  return attrs;
+}
+
+/**
+ * Dead air or unusable STT: up to MAX_SILENCE_PROMPTS human-style listens, then polite hangup.
+ * With <Gather action=/respond>, timeout POSTs here again with empty SpeechResult — one increment per listen window.
+ */
+function sendSilenceRetryOrHangup(res, req, callSid, opts = {}) {
+  const garbled = opts.garbled === true;
+  const baseUrl = getBaseUrl(req);
+  const voiceAttr = `voice="${VOICE}"`;
+  const session = voiceClaude.getCallSession(callSid);
+  session.silencePromptCount = (session.silencePromptCount || 0) + 1;
+  const n = session.silencePromptCount;
+
+  if (n > MAX_SILENCE_PROMPTS) {
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say ${voiceAttr}>Alright, I'm going to let you go — if you still need us, call back anytime. Take care!</Say>
+  <Hangup/>
+</Response>`;
+    res.type('text/xml');
+    return res.send(twiml);
+  }
+
+  let inner;
+  if (garbled) {
+    inner = `<Say ${voiceAttr}>That broke up on my end — could you say that once more?</Say>`;
+  } else if (n === 1) {
+    inner = `<Pause length="1"/>`;
+  } else if (n === 2) {
+    inner = `<Say ${voiceAttr}>Hello — you still there?</Say>`;
+  } else {
+    inner = `<Say ${voiceAttr}>I'll give you a few more seconds. Go ahead whenever you're ready.</Say>`;
+  }
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather ${gatherSpeechAttrs(baseUrl, SILENCE_RETRY_TIMEOUT)}>
+    ${inner}
+  </Gather>
+</Response>`;
+  res.type('text/xml');
+  return res.send(twiml);
+}
+
+// One <Gather> per TwiML: when action is set, Twilio POSTs to /respond on speech or timeout (verbs after Gather are skipped).
+function buildTwiML(res, sayText, req, isSSML = true, _callSid = null) {
   const baseUrl = getBaseUrl(req);
   const voiceAttr = `voice="${VOICE}"`;
 
@@ -44,41 +117,15 @@ function buildTwiML(res, sayText, req, isSSML = true, callSid = null) {
     sayContent = escapeXml(sayText);
   }
 
-  let secondGatherInner;
-  if (callSid) {
-    const session = voiceClaude.getCallSession(callSid);
-    const n = session.silencePromptCount || 0;
-    if (n === 0) {
-      secondGatherInner = `<Pause length="1"/>`;
-    } else {
-      secondGatherInner = `<Say ${voiceAttr}>Still there? Just say something when you're ready.</Say>`;
-    }
-  } else {
-    secondGatherInner = `<Pause length="1"/>`;
-  }
-
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
+  <Gather ${gatherSpeechAttrs(baseUrl, SPEECH_TIMEOUT)}>
     <Say ${voiceAttr}>${sayContent}</Say>
   </Gather>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT_EXTENDED}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
-    ${secondGatherInner}
-  </Gather>
-  <Say ${voiceAttr}>It seems like we lost each other. Feel free to call back anytime!</Say>
-  <Hangup/>
 </Response>`;
 
   res.type('text/xml');
   res.send(twiml);
-}
-
-function escapeXml(str) {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }
 
 /** Twilio From vs stored Lead.phone often differ (+1… vs digits) — try variants so returning callers hit the same lead. */
@@ -318,22 +365,13 @@ router.post('/respond', async (req, res) => {
 
   console.log(`[Voice] Speech from ${callSid}: "${speechResult}" (confidence: ${confidence})`);
 
-  if (!speechResult || speechResult.trim() === '') {
-    const session = voiceClaude.getCallSession(callSid);
-    session.silencePromptCount = (session.silencePromptCount || 0) + 1;
-    const baseUrl = getBaseUrl(req);
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
-    <Say voice="${VOICE}">Sorry, I didn't quite catch that — could you say that again?</Say>
-  </Gather>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT_EXTENDED}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}" bargeIn="true">
-    <Pause length="1"/>
-  </Gather>
-  <Hangup/>
-</Response>`;
-    res.type('text/xml');
-    return res.send(twiml);
+  const hasText = speechResult && speechResult.trim() !== '';
+  if (hasText && !Number.isNaN(MIN_SPEECH_CONFIDENCE) && MIN_SPEECH_CONFIDENCE > 0 && confidence < MIN_SPEECH_CONFIDENCE) {
+    return sendSilenceRetryOrHangup(res, req, callSid, { garbled: true });
+  }
+
+  if (!hasText) {
+    return sendSilenceRetryOrHangup(res, req, callSid, { garbled: false });
   }
 
   try {
@@ -367,13 +405,12 @@ router.post('/respond', async (req, res) => {
 // When gather times out without speech, redirect back to listening
 router.post('/listen', (req, res) => {
   const baseUrl = getBaseUrl(req);
+  const voiceAttr = `voice="${VOICE}"`;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${baseUrl}/api/voice/respond" method="POST" speechTimeout="${SPEECH_TIMEOUT}" speechModel="experimental_conversations" language="${SPEECH_LANGUAGE}">
-    <Say voice="${VOICE}">Whenever you're ready, go ahead.</Say>
+  <Gather ${gatherSpeechAttrs(baseUrl, SILENCE_RETRY_TIMEOUT)}>
+    <Say ${voiceAttr}>Whenever you're ready, go ahead.</Say>
   </Gather>
-  <Say voice="${VOICE}">It seems like we got disconnected. Feel free to call back anytime. Bye!</Say>
-  <Hangup/>
 </Response>`;
   res.type('text/xml');
   res.send(twiml);
