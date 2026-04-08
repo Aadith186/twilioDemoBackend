@@ -572,16 +572,17 @@ function buildRecentVoiceHandoffSystemBlock(handoff) {
     `The customer may have just come back to this web chat right after speaking with you on the phone. ` +
     `Their message might be short (e.g. hi, hello, hey).\n` +
     nameLine +
-    `What you covered on the call (for your memory only — do not paste this as a bullet report to the customer):\n${parts}\n\n` +
+    `What you covered on the call (internal notes — base your reply on these facts):\n${parts}\n\n` +
     `PRIORITY vs this web chat thread:\n` +
     `- The notes above are authoritative for facts stated on the phone (sqft, attached/detached, use case, region, etc.).\n` +
     `- If earlier web chat messages show you guessing a different size or asking open questions, IGNORE those for facts — the call wins.\n` +
     `- Do NOT ask again for information already established in the call notes (especially square footage and layout).\n\n` +
-    `How to reply:\n` +
-    `- Sound like you remember the call: 2–4 short sentences in plain prose — what you discussed, where things left off, and one clear next step or question.\n` +
-    `- Do NOT output a formatted recap card, markdown headings, or "CUSTOMER PROJECT DETAILS" style blocks unless they explicitly ask for a written summary.\n` +
+    `How to reply (this is their first web message after the call — they may have forgotten details):\n` +
+    `- Start with a brief recap for the customer in normal chat prose (about 2–4 short sentences): what you discussed on the phone, the main facts they gave (size, use, layout, region if any), and where you left off. Sound human — like you're picking the thread back up, not reading a form.\n` +
+    `- Purpose of that recap: help them remember the call; do not assume they recall everything.\n` +
+    `- After that recap, add one clear next question or next step — do not only recap without moving forward.\n` +
+    `- Do NOT use markdown headings, "CUSTOMER PROJECT DETAILS" blocks, or label-heavy bullet reports — plain paragraphs are fine.\n` +
     `- Do NOT open like a first-time web visitor (no "thanks for visiting" + asking for their name if you already have it from the call or prior chat).\n` +
-    `- Then continue the sale naturally from where the call ended.\n` +
     `---\n`
   );
 }
