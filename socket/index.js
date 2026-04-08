@@ -294,7 +294,8 @@ module.exports = function setupSockets(io) {
           return socket.emit('error', { message: 'Please add your phone number to continue chatting.' });
         }
 
-        // Phone calls that ended during this chat session: one-time system handoff to Alex (no UI bubble).
+        // Phone calls that ended after the customer's last web message (any chat thread for this lead).
+        // Uses last *user* message time so a new session after a call still sees the call (startedAt alone can miss that).
         let recentVoiceHandoff = undefined;
         let voiceHandoffIdsToMark = [];
         if (conversation.channel === 'chat') {
@@ -306,11 +307,14 @@ module.exports = function setupSockets(io) {
               .map((m) => (m.voiceConversationId ? m.voiceConversationId.toString() : null))
               .filter(Boolean)
           );
+          const lastUserChatAt = await claudeService.getLeadLastUserChatMessageAt(lead._id);
+          const sessionStartMs = new Date(conversation.startedAt).getTime();
+          const cutoffMs = lastUserChatAt > 0 ? lastUserChatAt : sessionStartMs;
           const voiceEnded = await Conversation.find({
             leadId: lead._id,
             channel: 'voice',
             status: 'ended',
-            endedAt: { $gte: conversation.startedAt },
+            endedAt: { $gt: new Date(cutoffMs) },
             _id: { $ne: conversation._id },
           })
             .sort({ endedAt: 1 })

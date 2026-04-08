@@ -270,6 +270,26 @@ async function fetchAllPriorConversationsForLead(leadId, { excludeConversationId
   return Conversation.find(filter).sort({ startedAt: 1 }).lean();
 }
 
+/**
+ * Latest timestamp (ms) of any user message across all web chat threads for this lead.
+ * Used to detect phone calls that ended after the customer's last web typing — including
+ * when they refresh and get a new chat session (startedAt after the call).
+ */
+async function getLeadLastUserChatMessageAt(leadId) {
+  if (leadId == null || leadId === '') return 0;
+  const convs = await Conversation.find({ leadId, channel: 'chat' }).select('messages').lean();
+  let maxTs = 0;
+  for (const c of convs) {
+    for (const m of c.messages || []) {
+      if (!m || m.role !== 'user' || !String(m.content || '').trim()) continue;
+      if (!m.timestamp) continue;
+      const t = new Date(m.timestamp).getTime();
+      if (!Number.isNaN(t) && t > maxTs) maxTs = t;
+    }
+  }
+  return maxTs;
+}
+
 /** Active thread summary for hybrid live context (voice CallSid or web sessionId). */
 async function getContextSummaryForSession(sessionId) {
   if (sessionId == null || String(sessionId).trim() === '') return '';
@@ -810,6 +830,7 @@ module.exports = {
   buildFullConversationMessages,
   resolveContextLimits,
   fetchAllPriorConversationsForLead,
+  getLeadLastUserChatMessageAt,
   getContextSummaryForSession,
   priorConversationsToUiHistoryMessages,
   voiceConversationToUiRecapRow,
