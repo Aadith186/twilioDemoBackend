@@ -57,6 +57,8 @@ const ConversationSchema = new mongoose.Schema({
   callDuration: Number,
   /** Voice Conversation ids for which we already ran the one-time chat handoff (no UI bubble). */
   voiceHandoffAppliedIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Conversation' }],
+  /** Dense facts from the latest phone call for this chat thread — keeps Alex aligned after handoff turns. */
+  voiceCallFactSheet: { type: String, default: '' },
 });
 
 // ─── LEAD SCHEMA ──────────────────────────────────────────────────────────────

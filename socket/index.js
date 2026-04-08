@@ -368,6 +368,7 @@ module.exports = function setupSockets(io) {
           {
             currentConversationSummary: conversation.contextSummary || '',
             recentVoiceHandoff,
+            voiceCallFactSheet: String(conversation.voiceCallFactSheet || '').trim(),
           }
         );
 
@@ -387,6 +388,12 @@ module.exports = function setupSockets(io) {
           conversation.voiceHandoffAppliedIds = [...merged].map(
             (id) => new mongoose.Types.ObjectId(id)
           );
+        }
+
+        if (voiceHandoffIdsToMark.length && recentVoiceHandoff?.summaries?.length) {
+          conversation.voiceCallFactSheet = recentVoiceHandoff.summaries
+            .join('\n\n---\n\n')
+            .slice(0, 8000);
         }
 
         await conversation.save();

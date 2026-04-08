@@ -219,6 +219,7 @@ Regional multipliers (mention this affects pricing):
 
 MEMORY INSTRUCTIONS:
 If you are given previous conversation history for a returning customer, reference it naturally. If they ask "do you remember our last chat?" or similar, summarise what you discussed, what quote was given, and any details they shared. Be specific — mention the project type, sqft, price range you gave, and anything personal they shared.
+If authoritative facts from a recent phone call are provided separately (voice handoff / fact sheet), they override vaguer or exploratory lines from this same web chat thread — e.g. do not re-ask square footage or layout if the call already locked them in, and do not treat an earlier rough range in chat as the source of truth when the call gave different numbers.
 
 IMPORTANT RULES:
 - Never make up details the customer hasn't provided
@@ -314,15 +315,46 @@ function voiceConversationFallbackExcerpt(conv) {
   return body;
 }
 
+const VOICE_HANDOFF_TAIL_MAX_TURNS = 14;
+const VOICE_HANDOFF_TAIL_MAX_CHARS = 4500;
+
+/** Latest turns (verbatim) — catches sqft and corrections often missing from rolling summary. */
+function voiceConversationTailExcerpt(conv) {
+  const msgs = (conv.messages || []).filter(
+    (m) => m && (m.role === 'user' || m.role === 'assistant') && m.content
+  );
+  if (msgs.length === 0) return '';
+  const start = Math.max(0, msgs.length - VOICE_HANDOFF_TAIL_MAX_TURNS);
+  const lines = [];
+  let len = 0;
+  for (let i = start; i < msgs.length; i++) {
+    const m = msgs[i];
+    const label = m.role === 'user' ? 'Customer' : 'Alex';
+    const line = `${label}: ${String(m.content).trim()}`;
+    if (len + line.length > VOICE_HANDOFF_TAIL_MAX_CHARS) break;
+    lines.push(line);
+    len += line.length + 1;
+  }
+  let body = lines.join('\n');
+  if (body.length > VOICE_HANDOFF_TAIL_MAX_CHARS) {
+    body = `…${body.slice(-(VOICE_HANDOFF_TAIL_MAX_CHARS - 1))}`;
+  }
+  return body;
+}
+
 /**
  * Map prior Conversation docs to rows for chat UI. Voice threads become one recap bubble each
  * (contextSummary + transcript fallback); chat threads stay one row per message.
  */
-/** Plain summary text for model context after a call (no markdown UI). */
+/** Plain summary + recent verbatim tail for model context after a call (no markdown UI). */
 function voiceConversationToHandoffSummaryText(conv) {
   if (!conv || conv.channel !== 'voice') return '';
   const summary = (conv.contextSummary || '').trim();
-  if (summary) return summary;
+  const tail = voiceConversationTailExcerpt(conv);
+  const parts = [];
+  if (summary) parts.push(`Rolling summary:\n${summary}`);
+  if (tail) parts.push(`End of call (verbatim):\n${tail}`);
+  if (parts.length) return parts.join('\n\n');
   return voiceConversationFallbackExcerpt(conv);
 }
 
@@ -521,11 +553,28 @@ function buildRecentVoiceHandoffSystemBlock(handoff) {
     `Their message might be short (e.g. hi, hello, hey).\n` +
     nameLine +
     `What you covered on the call (for your memory only — do not paste this as a bullet report to the customer):\n${parts}\n\n` +
+    `PRIORITY vs this web chat thread:\n` +
+    `- The notes above are authoritative for facts stated on the phone (sqft, attached/detached, use case, region, etc.).\n` +
+    `- If earlier web chat messages show you guessing a different size or asking open questions, IGNORE those for facts — the call wins.\n` +
+    `- Do NOT ask again for information already established in the call notes (especially square footage and layout).\n\n` +
     `How to reply:\n` +
     `- Sound like you remember the call: 2–4 short sentences in plain prose — what you discussed, where things left off, and one clear next step or question.\n` +
     `- Do NOT output a formatted recap card, markdown headings, or "CUSTOMER PROJECT DETAILS" style blocks unless they explicitly ask for a written summary.\n` +
     `- Do NOT open like a first-time web visitor (no "thanks for visiting" + asking for their name if you already have it from the call or prior chat).\n` +
     `- Then continue the sale naturally from where the call ended.\n` +
+    `---\n`
+  );
+}
+
+function buildPersistentVoiceFactSheetBlock(factSheet) {
+  const sheet = String(factSheet || '').trim();
+  if (!sheet) return '';
+  return (
+    `\n\n--- AUTHORITATIVE PHONE CALL FACTS (this chat session) ---\n` +
+    `The customer spoke with you on the phone. The block below is the source of truth for call-stated facts.\n` +
+    `This web transcript may include earlier lines where you suggested rough ranges or asked open questions — those do NOT override the call.\n` +
+    `Do not re-ask for square footage, footprint, attached vs detached, or primary use if already captured below. If they say "I said that on the call", align with this block.\n\n` +
+    `${sheet}\n` +
     `---\n`
   );
 }
@@ -542,8 +591,13 @@ async function chat(messages, previousConversations = [], options = {}) {
     liveTrimmed: built.liveTrimmed,
     usedPriorSummaries: built.usedPriorSummaries,
   });
-  const voiceHandoffBlock = buildRecentVoiceHandoffSystemBlock(options.recentVoiceHandoff);
-  const systemWithMemory = SALES_SYSTEM_PROMPT + memoryContext + voiceHandoffBlock;
+  let voiceCallContextBlock = '';
+  if (options.recentVoiceHandoff && options.recentVoiceHandoff.summaries && options.recentVoiceHandoff.summaries.length) {
+    voiceCallContextBlock = buildRecentVoiceHandoffSystemBlock(options.recentVoiceHandoff);
+  } else if (options.voiceCallFactSheet && String(options.voiceCallFactSheet).trim()) {
+    voiceCallContextBlock = buildPersistentVoiceFactSheetBlock(options.voiceCallFactSheet);
+  }
+  const systemWithMemory = SALES_SYSTEM_PROMPT + memoryContext + voiceCallContextBlock;
   const fullContextMessages = built.messages;
 
   const response = await client.messages.create({
