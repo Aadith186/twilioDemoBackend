@@ -71,7 +71,7 @@ async function mergeConversationContextSummary({
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 768,
-      system: `You maintain a compact MEMORY SUMMARY for a steel-building sales CRM. Output plain text only — short labeled lines or bullets. No markdown headings. Preserve EVERY concrete fact from the previous summary (names, numbers, sqft, locations, quotes, materials, timeline). Merge in the new exchange; do not drop prior facts unless the customer explicitly corrected them (then update). ${channelNote} Max length: about ${Math.floor(maxOut / 5)} words. Be dense.`,
+      system: `You maintain a compact MEMORY SUMMARY for a steel-building sales CRM. Output plain text only — short labeled lines or bullets. No markdown headings. Preserve EVERY concrete fact from the previous summary (names, numbers, sqft, locations, quotes, materials, timeline). Merge in the new exchange; do not drop prior facts unless the customer explicitly corrected them (then update). Never record or imply referrals to outside contractors, local vendors, or competitors — Steel Building Depot only. ${channelNote} Max length: about ${Math.floor(maxOut / 5)} words. Be dense.`,
       messages: [
         {
           role: 'user',
@@ -220,6 +220,11 @@ Regional multipliers (mention this affects pricing):
 MEMORY INSTRUCTIONS:
 If you are given previous conversation history for a returning customer, reference it naturally. If they ask "do you remember our last chat?" or similar, summarise what you discussed, what quote was given, and any details they shared. Be specific — mention the project type, sqft, price range you gave, and anything personal they shared.
 If authoritative facts from a recent phone call are provided separately (voice handoff / fact sheet), they override vaguer or exploratory lines from this same web chat thread — e.g. do not re-ask square footage or layout if the call already locked them in, and do not treat an earlier rough range in chat as the source of truth when the call gave different numbers.
+
+NO OUTSIDE REFERRALS (absolute — no exceptions):
+- Never recommend, suggest, or refer the customer to any other company, local vendor, local contractor, competitor, subcontractor, installer, or “someone in your area” — not for budget mismatch, not for timeline, not for project size, not for specialty work, not ever.
+- If their budget does not match your estimate: stay with Steel Building Depot only — discuss scope changes, phasing, material or finish options, or connecting them with a senior estimator / site visit. Never tell them to find another contractor or shop around with locals.
+- Do not name real or generic third-party businesses as an alternative. You represent Steel Building Depot exclusively for this conversation.
 
 IMPORTANT RULES:
 - Never make up details the customer hasn't provided
@@ -805,8 +810,8 @@ async function getGreeting(isReturning, leadName, previousConversations = [], op
       contextPrompt += `They have talked with us before. Use this so you sound like you remember (be specific — project type, location, numbers they gave, quote if any):\n${summary}\n\n`;
     }
     contextPrompt += forVoice
-      ? `Rules: 1–2 short sentences only, no bullets or lists, no markdown, no emoji. Sound relaxed and human (contractions OK). Mention something concrete from prior chats if you have it; otherwise warm generic welcome-back. One natural follow-up question. End there.]`
-      : `Keep greeting to 2 short sentences max. Tone: professional sales executive — warm but not casual (no "what's up", no buddy slang). Reference their prior project or quote if relevant. End with one clear next step or question.]`;
+      ? `Rules: 1–2 short sentences only, no bullets or lists, no markdown, no emoji. Sound relaxed and human (contractions OK). Mention something concrete from prior chats if you have it; otherwise warm generic welcome-back. One natural follow-up question. Never suggest other contractors or vendors. End there.]`
+      : `Keep greeting to 2 short sentences max. Tone: professional sales executive — warm but not casual (no "what's up", no buddy slang). Reference their prior project or quote if relevant. End with one clear next step or question. Never suggest other contractors or vendors.]`;
 
     const systemForGreeting = forVoice
       ? `You write brief, natural phone dialogue for a steel building sales rep. Never robotic, never corporate-AI. No markdown.`
