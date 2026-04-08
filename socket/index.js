@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
+const mongoose = require('mongoose');
 const { Lead, Conversation } = require('../models');
 const claudeService = require('../services/claude');
 const {
@@ -293,9 +294,14 @@ module.exports = function setupSockets(io) {
           return socket.emit('error', { message: 'Please add your phone number to continue chatting.' });
         }
 
-        // Phone calls that ended during this chat session: insert recap bubble(s) once, before this message.
+        // Phone calls that ended during this chat session: one-time system handoff to Alex (no UI bubble).
+        let recentVoiceHandoff = undefined;
+        let voiceHandoffIdsToMark = [];
         if (conversation.channel === 'chat') {
-          const alreadyRecapped = new Set(
+          const applied = new Set(
+            (conversation.voiceHandoffAppliedIds || []).map((id) => id.toString())
+          );
+          const recappedInThread = new Set(
             (conversation.messages || [])
               .map((m) => (m.voiceConversationId ? m.voiceConversationId.toString() : null))
               .filter(Boolean)
@@ -311,38 +317,34 @@ module.exports = function setupSockets(io) {
             .select('_id')
             .lean();
 
-          const pendingIds = voiceEnded
-            .map((v) => v._id.toString())
-            .filter((id) => !alreadyRecapped.has(id));
-
-          if (pendingIds.length) {
-            const freshList = await Promise.all(
-              pendingIds.map((id) => Conversation.findById(id).lean())
+          const pendingObjectIds = voiceEnded
+            .map((v) => v._id)
+            .filter(
+              (id) => !applied.has(id.toString()) && !recappedInThread.has(id.toString())
             );
-            const recapsForClient = [];
+
+          if (pendingObjectIds.length) {
+            const freshList = await Conversation.find({
+              _id: { $in: pendingObjectIds },
+              channel: 'voice',
+            })
+              .sort({ endedAt: 1 })
+              .lean();
+            const summaries = [];
+            const oidToMark = [];
             for (const fresh of freshList) {
-              if (!fresh || fresh.channel !== 'voice') continue;
-              const row = claudeService.voiceConversationToUiRecapRow(fresh);
-              if (!row) continue;
-              const ts = row.timestamp ? new Date(row.timestamp) : new Date();
-              conversation.messages.push({
-                role: 'assistant',
-                content: row.content,
-                timestamp: ts,
-                source: 'voice_call_summary',
-                voiceConversationId: fresh._id,
-              });
-              recapsForClient.push({
-                role: row.role,
-                content: row.content,
-                timestamp: ts,
-                quote: null,
-                source: 'voice_call_summary',
-              });
+              const text = claudeService.voiceConversationToHandoffSummaryText(fresh);
+              if (text && String(text).trim()) {
+                summaries.push(String(text).trim());
+                oidToMark.push(fresh._id);
+              }
             }
-            if (recapsForClient.length) {
-              await conversation.save();
-              socket.emit('voice_call_recaps', { messages: recapsForClient });
+            if (summaries.length) {
+              recentVoiceHandoff = {
+                summaries,
+                customerName: lead.name && lead.name !== 'Unknown' ? lead.name : undefined,
+              };
+              voiceHandoffIdsToMark = oidToMark;
             }
           }
         }
@@ -363,7 +365,10 @@ module.exports = function setupSockets(io) {
         const { text, quoteData } = await claudeService.chat(
           conversation.messages,
           previousConversations,
-          { currentConversationSummary: conversation.contextSummary || '' }
+          {
+            currentConversationSummary: conversation.contextSummary || '',
+            recentVoiceHandoff,
+          }
         );
 
         // Save AI response
@@ -372,6 +377,16 @@ module.exports = function setupSockets(io) {
         // If quote was generated, save it
         if (quoteData) {
           conversation.quote = quoteData;
+        }
+
+        if (voiceHandoffIdsToMark.length) {
+          const merged = new Set([
+            ...(conversation.voiceHandoffAppliedIds || []).map((x) => x.toString()),
+            ...voiceHandoffIdsToMark.map((x) => x.toString()),
+          ]);
+          conversation.voiceHandoffAppliedIds = [...merged].map(
+            (id) => new mongoose.Types.ObjectId(id)
+          );
         }
 
         await conversation.save();

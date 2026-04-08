@@ -55,6 +55,8 @@ const ConversationSchema = new mongoose.Schema({
   // Voice channel support
   channel: { type: String, enum: ['chat', 'voice'], default: 'chat' },
   callDuration: Number,
+  /** Voice Conversation ids for which we already ran the one-time chat handoff (no UI bubble). */
+  voiceHandoffAppliedIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Conversation' }],
 });
 
 // ─── LEAD SCHEMA ──────────────────────────────────────────────────────────────

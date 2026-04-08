@@ -318,6 +318,14 @@ function voiceConversationFallbackExcerpt(conv) {
  * Map prior Conversation docs to rows for chat UI. Voice threads become one recap bubble each
  * (contextSummary + transcript fallback); chat threads stay one row per message.
  */
+/** Plain summary text for model context after a call (no markdown UI). */
+function voiceConversationToHandoffSummaryText(conv) {
+  if (!conv || conv.channel !== 'voice') return '';
+  const summary = (conv.contextSummary || '').trim();
+  if (summary) return summary;
+  return voiceConversationFallbackExcerpt(conv);
+}
+
 /** One UI row for a ended voice thread (same shape as priorConversationsToUiHistoryMessages voice branch). */
 function voiceConversationToUiRecapRow(conv) {
   if (!conv || conv.channel !== 'voice') return null;
@@ -498,6 +506,30 @@ function buildFullConversationMessages(currentMessages, previousConversations = 
   return { messages, priorTrimmed, liveTrimmed, usedPriorSummaries };
 }
 
+function buildRecentVoiceHandoffSystemBlock(handoff) {
+  if (!handoff || !handoff.summaries || !handoff.summaries.length) return '';
+  const nameLine =
+    handoff.customerName && String(handoff.customerName).trim() && handoff.customerName !== 'Unknown'
+      ? `You already know their name: ${handoff.customerName.trim()}. Use it naturally; do not ask "what's your name?" again.\n`
+      : '';
+  const parts = handoff.summaries
+    .map((s, i) => `--- Phone call ${handoff.summaries.length > 1 ? i + 1 + ' ' : ''}(internal notes) ---\n${String(s).trim()}`)
+    .join('\n\n');
+  return (
+    `\n\n--- RETURNING FROM A RECENT PHONE CALL ---\n` +
+    `The customer may have just come back to this web chat right after speaking with you on the phone. ` +
+    `Their message might be short (e.g. hi, hello, hey).\n` +
+    nameLine +
+    `What you covered on the call (for your memory only — do not paste this as a bullet report to the customer):\n${parts}\n\n` +
+    `How to reply:\n` +
+    `- Sound like you remember the call: 2–4 short sentences in plain prose — what you discussed, where things left off, and one clear next step or question.\n` +
+    `- Do NOT output a formatted recap card, markdown headings, or "CUSTOMER PROJECT DETAILS" style blocks unless they explicitly ask for a written summary.\n` +
+    `- Do NOT open like a first-time web visitor (no "thanks for visiting" + asking for their name if you already have it from the call or prior chat).\n` +
+    `- Then continue the sale naturally from where the call ended.\n` +
+    `---\n`
+  );
+}
+
 // ─── MAIN CHAT FUNCTION ───────────────────────────────────────────────────────
 async function chat(messages, previousConversations = [], options = {}) {
   const currentConversationSummary = options.currentConversationSummary ?? '';
@@ -510,7 +542,8 @@ async function chat(messages, previousConversations = [], options = {}) {
     liveTrimmed: built.liveTrimmed,
     usedPriorSummaries: built.usedPriorSummaries,
   });
-  const systemWithMemory = SALES_SYSTEM_PROMPT + memoryContext;
+  const voiceHandoffBlock = buildRecentVoiceHandoffSystemBlock(options.recentVoiceHandoff);
+  const systemWithMemory = SALES_SYSTEM_PROMPT + memoryContext + voiceHandoffBlock;
   const fullContextMessages = built.messages;
 
   const response = await client.messages.create({
@@ -726,6 +759,7 @@ module.exports = {
   getContextSummaryForSession,
   priorConversationsToUiHistoryMessages,
   voiceConversationToUiRecapRow,
+  voiceConversationToHandoffSummaryText,
   finalizeVoiceContextSummaryOnHangup,
   applyScoreDataToLead,
   mergeConversationContextSummary,
