@@ -75,7 +75,8 @@ module.exports = function setupSockets(io) {
               role: m.role,
               content: m.content,
               quote: m.quote || null,
-              timestamp: m.timestamp || existing.startedAt
+              timestamp: m.timestamp || existing.startedAt,
+              ...(m.source ? { source: m.source } : {}),
             }));
 
             socket.emit('session_started', {
@@ -95,16 +96,8 @@ module.exports = function setupSockets(io) {
               })
               .then((previousConversations) => {
                 if (!previousConversations.length) return;
-                const historyMessages = previousConversations
-                  .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
-                  .flatMap((conv) =>
-                    (conv.messages || []).map((m) => ({
-                      role: m.role,
-                      content: m.content,
-                      timestamp: m.timestamp || conv.startedAt,
-                      quote: m.quote || null
-                    }))
-                  );
+                const historyMessages =
+                  claudeService.priorConversationsToUiHistoryMessages(previousConversations);
                 socket.emit('history_loaded', { historyMessages });
               })
               .catch((err) => console.error('history_loaded error:', err));
@@ -179,16 +172,8 @@ module.exports = function setupSockets(io) {
 
         // Send previous history after session is ready
         if (priorOtherConversations.length) {
-          const historyMessages = priorOtherConversations
-            .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
-            .flatMap((conv) =>
-              (conv.messages || []).map((m) => ({
-                role: m.role,
-                content: m.content,
-                timestamp: m.timestamp || conv.startedAt,
-                quote: m.quote || null
-              }))
-            );
+          const historyMessages =
+            claudeService.priorConversationsToUiHistoryMessages(priorOtherConversations);
           socket.emit('history_loaded', { historyMessages });
         }
 
@@ -306,6 +291,60 @@ module.exports = function setupSockets(io) {
 
         if (leadNeedsPhone(lead)) {
           return socket.emit('error', { message: 'Please add your phone number to continue chatting.' });
+        }
+
+        // Phone calls that ended during this chat session: insert recap bubble(s) once, before this message.
+        if (conversation.channel === 'chat') {
+          const alreadyRecapped = new Set(
+            (conversation.messages || [])
+              .map((m) => (m.voiceConversationId ? m.voiceConversationId.toString() : null))
+              .filter(Boolean)
+          );
+          const voiceEnded = await Conversation.find({
+            leadId: lead._id,
+            channel: 'voice',
+            status: 'ended',
+            endedAt: { $gte: conversation.startedAt },
+            _id: { $ne: conversation._id },
+          })
+            .sort({ endedAt: 1 })
+            .select('_id')
+            .lean();
+
+          const pendingIds = voiceEnded
+            .map((v) => v._id.toString())
+            .filter((id) => !alreadyRecapped.has(id));
+
+          if (pendingIds.length) {
+            const freshList = await Promise.all(
+              pendingIds.map((id) => Conversation.findById(id).lean())
+            );
+            const recapsForClient = [];
+            for (const fresh of freshList) {
+              if (!fresh || fresh.channel !== 'voice') continue;
+              const row = claudeService.voiceConversationToUiRecapRow(fresh);
+              if (!row) continue;
+              const ts = row.timestamp ? new Date(row.timestamp) : new Date();
+              conversation.messages.push({
+                role: 'assistant',
+                content: row.content,
+                timestamp: ts,
+                source: 'voice_call_summary',
+                voiceConversationId: fresh._id,
+              });
+              recapsForClient.push({
+                role: row.role,
+                content: row.content,
+                timestamp: ts,
+                quote: null,
+                source: 'voice_call_summary',
+              });
+            }
+            if (recapsForClient.length) {
+              await conversation.save();
+              socket.emit('voice_call_recaps', { messages: recapsForClient });
+            }
+          }
         }
 
         // Save user message

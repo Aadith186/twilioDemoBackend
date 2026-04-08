@@ -34,7 +34,10 @@ const MessageSchema = new mongoose.Schema({
   role: { type: String, enum: ['user', 'assistant'], required: true },
   content: { type: String, required: true },
   timestamp: { type: Date, default: Date.now },
-  quote: QuoteSchema
+  quote: QuoteSchema,
+  /** e.g. voice_call_summary — injected when user returns to chat after a phone call */
+  source: { type: String },
+  voiceConversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation' },
 });
 
 // ─── CONVERSATION SCHEMA ──────────────────────────────────────────────────────

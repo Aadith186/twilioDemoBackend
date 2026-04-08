@@ -453,6 +453,10 @@ router.post('/status', async (req, res) => {
       if (callDuration) conversation.callDuration = callDuration;
       await conversation.save();
 
+      void claudeService
+        .finalizeVoiceContextSummaryOnHangup(conversation._id)
+        .catch((e) => console.error('[Voice] finalizeVoiceContextSummaryOnHangup:', e.message || e));
+
       const lead = await Lead.findById(conversation.leadId);
       if (lead) {
         lead.lastSeen = new Date();
@@ -482,6 +486,9 @@ router.post('/status', async (req, res) => {
       conversation.endedAt = new Date();
       if (callDuration) conversation.callDuration = callDuration;
       await conversation.save();
+      void claudeService
+        .finalizeVoiceContextSummaryOnHangup(conversation._id)
+        .catch((e) => console.error('[Voice] finalizeVoiceContextSummaryOnHangup:', e.message || e));
       console.log(`[Voice] Call finalized (no session). Conversation ${conversation._id}`);
       return res.json({ ok: true });
     }
@@ -519,6 +526,9 @@ router.post('/status', async (req, res) => {
       callDuration: callDuration || undefined,
     });
     await newConv.save();
+    void claudeService
+      .finalizeVoiceContextSummaryOnHangup(newConv._id)
+      .catch((e) => console.error('[Voice] finalizeVoiceContextSummaryOnHangup:', e.message || e));
     lead.conversations.push(newConv._id);
     lead.totalConversations = lead.conversations.length;
     lead.lastSeen = new Date();

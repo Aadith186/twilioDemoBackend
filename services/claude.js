@@ -49,7 +49,8 @@ async function mergeConversationContextSummary({
   newUserContent = '',
   newAssistantContent = '',
   channel = 'chat',
-}) {
+  userMessageOnly = false,
+} = {}) {
   const maxOut = resolveSummaryMaxChars();
   const prev = String(previousSummary || '').trim();
   const u = String(newUserContent || '').trim();
@@ -61,6 +62,11 @@ async function mergeConversationContextSummary({
       ? 'This exchange was on a phone call — keep spoken tone out of the summary; store facts only.'
       : 'Web chat exchange.';
 
+  const userPayload =
+    userMessageOnly && u
+      ? `PREVIOUS SUMMARY (keep all facts unless corrected):\n${prev || '(none)'}\n\nThe customer’s last message on a phone call (no assistant reply was recorded after it):\n${u}\n\nFold any new facts from that message into the summary. Do not mention missing replies or the call ending. Reply with the updated summary only.`
+      : `PREVIOUS SUMMARY (keep all facts unless corrected):\n${prev || '(none)'}\n\nNEW — Customer:\n${u}\n\nNEW — Alex:\n${a}\n\nReply with the updated summary only.`;
+
   try {
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -69,7 +75,7 @@ async function mergeConversationContextSummary({
       messages: [
         {
           role: 'user',
-          content: `PREVIOUS SUMMARY (keep all facts unless corrected):\n${prev || '(none)'}\n\nNEW — Customer:\n${u}\n\nNEW — Alex:\n${a}\n\nReply with the updated summary only.`,
+          content: userPayload,
         },
       ],
     });
@@ -268,6 +274,110 @@ async function getContextSummaryForSession(sessionId) {
   if (sessionId == null || String(sessionId).trim() === '') return '';
   const c = await Conversation.findOne({ sessionId: String(sessionId) }).select('contextSummary').lean();
   return c && c.contextSummary ? String(c.contextSummary).trim() : '';
+}
+
+const VOICE_UI_FALLBACK_MAX_CHARS = 2000;
+const VOICE_UI_FALLBACK_MAX_TURNS = 12;
+
+function formatVoiceCallWhenForUi(conv) {
+  const d = conv.endedAt || conv.startedAt;
+  if (!d) return 'recent call';
+  try {
+    return new Date(d).toLocaleString(undefined, {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    });
+  } catch {
+    return String(d);
+  }
+}
+
+function voiceConversationFallbackExcerpt(conv) {
+  const msgs = (conv.messages || []).filter(
+    (m) => m && (m.role === 'user' || m.role === 'assistant') && m.content
+  );
+  if (msgs.length === 0) return 'Brief phone call — no transcript details saved.';
+  const lines = [];
+  let len = 0;
+  for (let i = 0; i < Math.min(msgs.length, VOICE_UI_FALLBACK_MAX_TURNS); i++) {
+    const m = msgs[i];
+    const label = m.role === 'user' ? 'You' : 'Alex';
+    const line = `${label}: ${String(m.content).trim()}`;
+    if (len + line.length > VOICE_UI_FALLBACK_MAX_CHARS) break;
+    lines.push(line);
+    len += line.length + 1;
+  }
+  let body = lines.join('\n');
+  if (body.length > VOICE_UI_FALLBACK_MAX_CHARS) {
+    body = `${body.slice(0, VOICE_UI_FALLBACK_MAX_CHARS - 1)}…`;
+  }
+  return body;
+}
+
+/**
+ * Map prior Conversation docs to rows for chat UI. Voice threads become one recap bubble each
+ * (contextSummary + transcript fallback); chat threads stay one row per message.
+ */
+/** One UI row for a ended voice thread (same shape as priorConversationsToUiHistoryMessages voice branch). */
+function voiceConversationToUiRecapRow(conv) {
+  if (!conv || conv.channel !== 'voice') return null;
+  const when = formatVoiceCallWhenForUi(conv);
+  const summary = (conv.contextSummary || '').trim();
+  const body = summary
+    ? `**Phone call** (${when})\n\nHere's what we covered:\n\n${summary}`
+    : `**Phone call** (${when})\n\n${voiceConversationFallbackExcerpt(conv)}`;
+  const ts = conv.endedAt || conv.startedAt || new Date();
+  return {
+    role: 'assistant',
+    content: body,
+    timestamp: ts,
+    quote: null,
+    source: 'voice_call_summary',
+  };
+}
+
+function priorConversationsToUiHistoryMessages(conversations) {
+  const sorted = [...(conversations || [])].sort(
+    (a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime()
+  );
+  return sorted.flatMap((conv) => {
+    if (conv.channel === 'voice') {
+      const row = voiceConversationToUiRecapRow(conv);
+      return row ? [row] : [];
+    }
+    return (conv.messages || []).map((m) => ({
+      role: m.role,
+      content: m.content,
+      timestamp: m.timestamp || conv.startedAt,
+      quote: m.quote || null,
+    }));
+  });
+}
+
+/**
+ * If the call ended right after the customer spoke (no assistant reply yet), fold that line into contextSummary.
+ */
+async function finalizeVoiceContextSummaryOnHangup(conversationId) {
+  if (!conversationId) return;
+  try {
+    const conv = await Conversation.findById(conversationId).lean();
+    if (!conv || !conv.messages || conv.messages.length === 0) return;
+    const last = conv.messages[conv.messages.length - 1];
+    if (last.role !== 'user') return;
+    const merged = await mergeConversationContextSummary({
+      previousSummary: conv.contextSummary || '',
+      newUserContent: String(last.content || ''),
+      newAssistantContent: '',
+      channel: 'voice',
+      userMessageOnly: true,
+    });
+    await Conversation.findByIdAndUpdate(conversationId, {
+      contextSummary: merged,
+      contextSummaryUpdatedAt: new Date(),
+    });
+  } catch (e) {
+    console.error('[Claude] finalizeVoiceContextSummaryOnHangup:', e.message || e);
+  }
 }
 
 /**
@@ -614,6 +724,9 @@ module.exports = {
   resolveContextLimits,
   fetchAllPriorConversationsForLead,
   getContextSummaryForSession,
+  priorConversationsToUiHistoryMessages,
+  voiceConversationToUiRecapRow,
+  finalizeVoiceContextSummaryOnHangup,
   applyScoreDataToLead,
   mergeConversationContextSummary,
   refreshContextSummaryAfterTurn,
