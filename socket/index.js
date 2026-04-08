@@ -1,6 +1,12 @@
 const { v4: uuidv4 } = require('uuid');
 const { Lead, Conversation } = require('../models');
 const claudeService = require('../services/claude');
+const {
+  findLeadByCallerPhone,
+  normalizePhoneForLead,
+  isPhoneInputValid,
+  leadNeedsPhone,
+} = require('../utils/phone');
 
 /** Allow reconnect / refresh to reopen a recently ended conversation (ms). */
 const RESUME_CONVERSATION_MS = 30 * 60 * 1000;
@@ -79,7 +85,8 @@ module.exports = function setupSockets(io) {
               isReturning,
               resumed: true,
               greeting: null,
-              messages: uiMessages
+              messages: uiMessages,
+              needsPhone: leadNeedsPhone(lead),
             });
 
             claudeService
@@ -166,7 +173,8 @@ module.exports = function setupSockets(io) {
           conversationId: conversation._id.toString(),
           isReturning,
           resumed: false,
-          greeting: greetingToSend
+          greeting: greetingToSend,
+          needsPhone: leadNeedsPhone(lead),
         });
 
         // Send previous history after session is ready
@@ -191,12 +199,97 @@ module.exports = function setupSockets(io) {
           isReturning,
           tier: lead.tier,
           score: lead.score,
-          timestamp: new Date()
+          timestamp: new Date(),
+          channel: 'chat',
+          phone: lead.phone && String(lead.phone).trim() ? lead.phone : undefined,
         });
 
       } catch (err) {
         console.error('start_session error:', err);
         socket.emit('error', { message: 'Failed to start session' });
+      }
+    });
+
+    // ─── SET LEAD PHONE (chat ↔ voice identity for demo) ────────────────────
+    socket.on('set_lead_phone', async ({ phone }) => {
+      try {
+        if (!socket.leadId || !socket.conversationId) {
+          return socket.emit('phone_rejected', { message: 'No active session' });
+        }
+        if (!isPhoneInputValid(phone)) {
+          return socket.emit('phone_rejected', {
+            message: 'Enter a valid phone number (at least 10 digits).',
+          });
+        }
+
+        const leadA = await Lead.findById(socket.leadId);
+        const conversation = await Conversation.findById(socket.conversationId);
+        if (!leadA || !conversation) {
+          return socket.emit('phone_rejected', { message: 'Session expired. Please refresh.' });
+        }
+
+        const normalized = normalizePhoneForLead(phone);
+        const leadB = await findLeadByCallerPhone(phone);
+
+        // Same lead or no existing lead for this number: store phone on current lead.
+        if (!leadB || leadB._id.toString() === leadA._id.toString()) {
+          leadA.phone = normalized;
+          await leadA.save();
+          socket.emit('phone_saved', {
+            leadId: leadA._id.toString(),
+            conversationId: conversation._id.toString(),
+          });
+          io.to('admin').emit('lead_phone_updated', {
+            leadId: leadA._id.toString(),
+            phone: leadA.phone,
+            channel: 'chat',
+          });
+          return;
+        }
+
+        // Merge: reassign this chat thread to the canonical lead (e.g. they called this number first).
+        conversation.leadId = leadB._id;
+        await conversation.save();
+
+        leadA.conversations = (leadA.conversations || []).filter(
+          (cid) => cid.toString() !== conversation._id.toString()
+        );
+        leadA.totalConversations = leadA.conversations.length;
+        await leadA.save();
+
+        const alreadyOnB = (leadB.conversations || []).some(
+          (cid) => cid.toString() === conversation._id.toString()
+        );
+        if (!alreadyOnB) {
+          leadB.conversations.push(conversation._id);
+          leadB.totalConversations = leadB.conversations.length;
+        }
+        if (!leadB.phone || !String(leadB.phone).trim()) {
+          leadB.phone = normalized;
+        }
+        leadB.lastSeen = new Date();
+        await leadB.save();
+
+        if (leadA.conversations.length === 0) {
+          await Lead.deleteOne({ _id: leadA._id });
+        }
+
+        socket.leadId = leadB._id.toString();
+        socket.conversationId = conversation._id.toString();
+
+        socket.emit('phone_saved', {
+          leadId: leadB._id.toString(),
+          conversationId: conversation._id.toString(),
+        });
+
+        io.to('admin').emit('lead_phone_updated', {
+          leadId: leadB._id.toString(),
+          phone: leadB.phone,
+          channel: 'chat',
+        });
+      } catch (err) {
+        console.error('set_lead_phone error:', err);
+        socket.emit('phone_rejected', { message: 'Could not save phone. Try again.' });
       }
     });
 
@@ -210,6 +303,10 @@ module.exports = function setupSockets(io) {
         const conversation = await Conversation.findById(socket.conversationId);
         const lead = await Lead.findById(socket.leadId);
         if (!conversation || !lead) return;
+
+        if (leadNeedsPhone(lead)) {
+          return socket.emit('error', { message: 'Please add your phone number to continue chatting.' });
+        }
 
         // Save user message
         conversation.messages.push({ role: 'user', content });

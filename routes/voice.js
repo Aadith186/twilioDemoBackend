@@ -3,6 +3,7 @@ const router = express.Router();
 const { Lead, Conversation } = require('../models');
 const claudeService = require('../services/claude');
 const voiceClaude = require('../services/voice-claude');
+const { findLeadByCallerPhone } = require('../utils/phone');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 // Twilio voice options — change these to your preference
@@ -157,28 +158,6 @@ function buildTwiML(res, sayText, req, isSSML = true, _callSid = null) {
 
   res.type('text/xml');
   res.send(twiml);
-}
-
-/** Twilio From vs stored Lead.phone often differ (+1… vs digits) — try variants so returning callers hit the same lead. */
-function callerPhoneVariants(callerPhone) {
-  if (!callerPhone || callerPhone === 'unknown') return [];
-  const raw = String(callerPhone).trim();
-  const variants = new Set([raw]);
-  const digits = raw.replace(/\D/g, '');
-  if (digits.length >= 10) {
-    const last10 = digits.slice(-10);
-    variants.add(last10);
-    variants.add(`+1${last10}`);
-    variants.add(`1${last10}`);
-    variants.add(`+${digits}`);
-  }
-  return [...variants];
-}
-
-async function findLeadByCallerPhone(callerPhone) {
-  const variants = callerPhoneVariants(callerPhone);
-  if (variants.length === 0) return null;
-  return Lead.findOne({ phone: { $in: variants } });
 }
 
 function mapSessionMessagesToSchema(session) {
